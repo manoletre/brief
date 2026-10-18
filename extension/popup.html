@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  :root { --bg:#fbfaf7; --fg:#1d1d1b; --muted:#6b6a65; --line:#e6e3dc; --chip:#f1eee7; --accent:#c2410c; --good:#15803d; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161614; --fg:#ecebe6; --muted:#9a988f; --line:#2c2b28; --chip:#272622; --accent:#fb923c; --good:#6fd59a; --bad:#f87171; } }
+  body { margin:0; width: 300px; background: var(--bg); color: var(--fg); font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; }
+  .wrap { padding: 14px 16px; }
+  h1 { font-size: 15px; margin: 0 0 2px; display:flex; align-items:center; gap:8px; color: var(--accent); }
+  h1 img { width: 18px; height: 18px; }
+  .status { color: var(--muted); margin-bottom: 12px; } .status b.ok { color: var(--good); } .status b.bad { color: var(--bad); }
+  .stat { font-size: 26px; font-weight: 700; } .muted { color: var(--muted); }
+  button { font: inherit; color: var(--fg); background: var(--chip); border: 1px solid var(--line); border-radius: 7px; padding: 6px 10px; cursor: pointer; width: 100%; margin-top: 8px; text-align: left; }
+  button:hover { border-color: var(--muted); }
+  ul { list-style: none; padding: 0; margin: 6px 0 0; max-height: 110px; overflow: auto; }
+  li { display:flex; justify-content: space-between; padding: 2px 0; color: var(--muted); }
+  li a { color: var(--muted); cursor: pointer; text-decoration: none; } li a:hover { color: var(--bad); }
+  details { margin-top: 12px; } summary { cursor: pointer; color: var(--muted); }
+  .foot { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); } .foot a { color: var(--accent); }
+</style></head>
+<body><div class="wrap">
+  <h1><img src="icon.png" alt="">brief</h1>
+  <div class="status" id="status">…</div>
+  <div><span class="stat" id="today">0 min</span> <span class="muted">in front of the browser today</span></div>
+  <button id="pause"></button>
+  <button id="block"></button>
+  <details><summary>Sites brief never records</summary><ul id="blocked"></ul></details>
+  <div class="foot"><a id="open" href="#">Open today's brief →</a></div>
+</div><script src="config.js"></script><script src="popup.js"></script></body></html>
