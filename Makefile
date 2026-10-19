@@ -8,6 +8,7 @@ LABELS := com.brief.serve com.brief.serve.brieff
 
 install:
 	cargo build --release
+	@mkdir -p $(HOME)/.cargo/bin
 	@ln -sf $(CURDIR)/target/release/brief $(HOME)/.cargo/bin/brief
 	@$(CURDIR)/target/release/brief extension --no-open >/dev/null
 	@$(CURDIR)/target/release/brief browser update | grep -v "up to date\|isn't installed" || true
