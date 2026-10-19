@@ -1,0 +1,10 @@
+Generated with the built-in image_gen tool. Transparent background enabled.
+
+Use case: logo-brand.
+Asset type: finished app icon / brand symbol for "brief", a personal morning briefing app that turns scattered work into clear daily priorities.
+Primary request: A stunning but extremely simple 3D-ish logo. Evolve a page-and-sun symbol into an elegant sculptural mark: one thick warm-ivory rounded page, with just two short recessed horizontal strokes, standing in front of a single softly glowing apricot rising-sun disc peeking from the upper-right. Visually cohesive, calm, confident, immediately legible at tiny sizes.
+Style/medium: premium restrained 3D product icon, softly beveled ceramic shapes, tactile satin finish, subtle ambient occlusion and crisp silhouette. Near-frontal view with only slight depth, no dramatic perspective.
+Color palette: burnt orange / terracotta rounded-square tile, ivory page, apricot sun. Warm existing brand palette.
+Composition: one centered icon, generous consistent margins, fills about 84% of a square canvas. Rounded-square tile is part of the logo; everything outside tile genuinely transparent.
+Lighting: soft upper-left studio light, delicate warm highlights and shallow shadows, polished and understated.
+Constraints: only the tile, the page, its two recessed strokes and the sun. No text, no letters, no wordmark, no extra symbols, no sparkles, no scenery, no mockup, no watermark. Avoid excessive gloss, noisy textures, many layers, tiny details. Produce a single finished logo, not a presentation sheet.

@@ -1,18 +1,19 @@
 # brief
 
-Your chatbots log what you work on through MCP. Every morning, your local Claude Code
+brief is a shared memory that keeps you accountable. Your agents and chatbots log what you work
+on through MCP. Every morning, the agent you picked (Claude Code, Codex, Cline or OpenCode)
 compares your objectives with where your time actually went (that log, your calendar,
 what you read in your browser, your to-do list and meeting notes) and writes you a brief to
 help you reprioritise: what to do more of, less of, stop or move, plus feedback,
 connections, blind spots, things to read and next steps for today.
 
     make                 # build, link `brief` onto PATH, restart the service if running
-    brief init           # Claude interviews you about your objectives
+    brief init           # onboarding, in the terminal: agent, objectives, connections, first brief
     brief calendar       # let the brief read your calendar (Calendar app)
     brief browser        # install (or update) the extension in your browser (Dia, Arc, Chrome…)
     brief install        # run `brief serve` at login (launchd)
     brief connect        # how to hook up each chatbot
-    brief open           # http://127.0.0.1:7878
+    brief open           # http://127.0.0.1:7878, your briefs (the only part on the web)
 
 While developing, just run `make` after each change: ~/.cargo/bin/brief is a symlink
 to target/release/brief, so the command, the background service and the chatbots'
@@ -30,16 +31,32 @@ MCP tools: `log_work` (write) and `get_context` (read) for the journal; `anki_se
 (read) and `anki_add_cards` (write) for Anki; `get_todos` (read), `add_todo` and `update_todo`
 (write) for your to-do list.
 
-## Objectives interview
+## Onboarding
 
-`brief init` (or Objectives → *Refine them with Claude*, or `i` on the app's objectives screen) opens
-http://127.0.0.1:7878/onboarding: Claude (`claude -p`, sonnet, no tools) asks one question at a time:
-what you're working towards, then per objective why it matters, what done looks like, the deadline,
-how much time it should get and gets now, and what's in the way, then how they rank. It ends with
-a ranked list you can edit and reorder before saving. Each objective is stored in objectives.md
-with `Priority:`, `Why:`, `Done when:`, `Deadline:`, `Time:` lines, which the brief writer uses to
-judge your days. If you already have objectives, it sharpens them instead of starting over. The
-conversation is kept in the browser until you save, so a reload doesn't lose it.
+`brief init` (and `brief` the first time) runs entirely in the terminal (`src/onboard.rs`):
+
+1. **What brief is**: a shared memory that keeps you accountable.
+2. **Your accountability agent**: Claude Code, Codex, Cline or OpenCode, run headless on your own
+   account (`src/agent.rs`). brief shows which are installed and signed in, offers to install one
+   (`npm install -g …`) or run its sign-in, and then asks for a model, recommended one first
+   (Claude: Opus; Cline: Claude Sonnet 5.5). "Suggest one" opens an email to hi@manoletre.com.
+   The choice is kept in config.json as `agent` and `model`, and this agent also writes every brief.
+3. **Your objectives**: a conversation driven by that agent (`src/interview.rs`), shaped after
+   Schimpf, Voigt & Bohné, [AI-Assisted Goal Setting Improves Goal Progress Through Social
+   Accountability](https://arxiv.org/abs/2603.17887): background, what energises you, priorities, then
+   short- and long-term goals formulated together, with a should-versus-want check and a closing
+   "can I hold you to these?". Each objective is stored in objectives.md with `Priority:`,
+   `Horizon:`, `Why:`, `Done when:`, `Deadline:`, `Time:` lines. In the app, `i` on the objectives
+   screen runs the same conversation again.
+4. **Connect your agents**: brief's MCP server goes into Claude Code, Claude Desktop, Codex
+   (`codex mcp add`), Cline (`~/.cline/data/settings/cline_mcp_settings.json`) and OpenCode
+   (`~/.config/opencode/opencode.json`), so they log your work. "Do this later" skips it.
+5. **Connect your tools**: Calendar, Todoist, Granola, the browser extension, Anki, and
+   [Composio](https://composio.dev) for everything else: brief installs its CLI, runs `composio login`
+   and `composio link <app>` for the apps you name, and the brief writer then reads them with
+   `composio search` / `composio execute` (read-only tools only).
+6. **Every morning**: run in the background (launchd), then a **first brief** written right away,
+   which you can open in the browser, and a rating and comment that tomorrow's brief reads.
 
 ## The brief page
 

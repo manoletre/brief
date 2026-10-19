@@ -1,15 +1,11 @@
-//! Builds the daily brief by running the local Claude Code CLI (`claude -p`),
-//! so it uses your existing Claude subscription. No API key involved.
+//! Builds the daily brief by running the user's agent CLI headless (Claude Code by default, or
+//! Codex, Cline, OpenCode; see agent.rs), so it uses their existing subscription. No API key involved.
 
 use crate::{anki, browsing, calendar, granola, todoist};
 use crate::store::{Brief, Store};
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use chrono::{Duration, Local};
-use serde_json::Value;
 use std::fmt::Write as _;
-use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 const TIMEOUT_MINUTES: u64 = 20;
 
@@ -35,39 +31,15 @@ pub async fn generate(store: &Store) -> Result<Brief> {
     let (anki, todo, meetings, cal) = (anki.await.unwrap_or_default(), todo.await.unwrap_or_default(), meetings.await.unwrap_or_default(), cal.await.unwrap_or_default());
     let web = browsing::brief_context(store, since);
     let prompt = build_prompt(store, &Sources { anki: &anki, todo: &todo, meetings: &meetings, calendar: &cal, browsing: &web });
-    let claude = find_claude().context("could not find the `claude` CLI; install Claude Code or put it on PATH")?;
-
-    let mut child = Command::new(claude)
-        .args(["-p", "--output-format", "json", "--model", &cfg.model])
-        .args(["--allowedTools", "WebSearch,WebFetch"])
-        .args(["--disallowedTools", "Bash,Edit,Write,NotebookEdit"])
-        // Empty working dir so no project CLAUDE.md leaks into the brief.
-        .current_dir(store.root.join("work"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to start claude")?;
-    child.stdin.take().unwrap().write_all(prompt.as_bytes()).await?;
-
-    let out = tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_MINUTES * 60), child.wait_with_output())
-        .await
-        .context("claude timed out")??;
-    if !out.status.success() {
-        bail!("claude exited with {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
-    }
-
-    let envelope: Value = serde_json::from_slice(&out.stdout).context("unexpected output from claude")?;
-    if envelope.get("is_error").and_then(Value::as_bool) == Some(true) {
-        bail!("claude reported an error: {}", envelope.get("result").unwrap_or(&Value::Null));
-    }
-    let text = envelope.get("result").and_then(Value::as_str).unwrap_or_default();
+    let (agent, model) = crate::agent::configured(store);
+    let tools = crate::agent::Tools::Research { composio: cfg.composio };
+    let reply = agent.ask(store, &model, &prompt, tools, std::time::Duration::from_secs(TIMEOUT_MINUTES * 60)).await?;
+    let text = reply.text.as_str();
 
     let mut brief = parse_brief(text);
     brief.date = Some(Local::now().date_naive());
     brief.generated_at = Some(Local::now());
-    brief.cost_usd = envelope.get("total_cost_usd").and_then(Value::as_f64);
+    brief.cost_usd = reply.cost_usd;
     for (si, section) in brief.sections.iter_mut().enumerate() {
         for (ii, item) in section.items.iter_mut().enumerate() {
             item.id = format!("s{si}i{ii}");
@@ -79,11 +51,7 @@ pub async fn generate(store: &Store) -> Result<Brief> {
 
 /// Take the JSON object out of the model's reply; fall back to showing the raw text.
 fn parse_brief(text: &str) -> Brief {
-    let json = match (text.find('{'), text.rfind('}')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => "",
-    };
-    serde_json::from_str::<Brief>(json).unwrap_or_else(|_| Brief {
+    serde_json::from_str::<Brief>(crate::agent::json_object(text)).unwrap_or_else(|_| Brief {
         headline: "Daily brief (unstructured)".into(),
         summary: text.to_owned(),
         ..Default::default()
@@ -300,6 +268,18 @@ Name the person and the meeting.\n\
 Never summarise meetings back; only bring up what changes what they should do today.\n\n",
         );
         p.push_str(meetings);
+    }
+
+    if store.config().composio {
+        p.push_str(
+            "\n# Composio\n\nThe user connected more of their apps (mail, chat, docs, issue trackers…) through Composio. \
+You can read them with the `composio` command: `composio search \"<what you need>\"` finds the right tool, \
+`composio execute <TOOL_SLUG> --get-schema` shows its inputs, and `composio execute <TOOL_SLUG> -d '{...}'` runs \
+it. Only ever run tools that READ (list, get, search, fetch); never send, post, create, update or delete \
+anything. Look at what happened since the last brief in the apps that matter for their objectives (unanswered \
+threads, mentions, issues assigned to them, docs they edited) and use it like the other evidence above; say in \
+`why` which app it came from. Skip this if the command fails.\n\n",
+        );
     }
 
     p.push_str(

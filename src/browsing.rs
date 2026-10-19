@@ -24,7 +24,7 @@ const FILES: [(&str, &str); 5] = [
     ("popup.html", include_str!("../extension/popup.html")),
     ("popup.js", include_str!("../extension/popup.js")),
 ];
-const ICON: &[u8] = include_bytes!("../assets/icon.png");
+const ICON: &[u8] = include_bytes!("../assets/icon-3d.png");
 
 /// The page text kept per visit, and in the brief prompt overall.
 const MAX_EXCERPT: usize = 1500;

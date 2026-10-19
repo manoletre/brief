@@ -1,15 +1,15 @@
 //! `brief serve`: MCP over streamable HTTP at /mcp, the briefs website at /, and a
 //! scheduler that writes the daily brief once per day after `brief_hour`.
 
-use crate::{anki, browsing, generate, html, interview, mcp, store::{Feedback, Store}};
+use crate::{anki, browsing, generate, html, mcp, store::{Feedback, Store}};
 use anyhow::Result;
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
-    Form, Json, Router,
+    Json, Router,
 };
 use chrono::{DateTime, Local, NaiveDate, Timelike};
 use serde::Deserialize;
@@ -54,13 +54,7 @@ pub async fn serve(store: Store) -> Result<()> {
         .route("/", get(index))
         .route("/today", get(today))
         .route("/brief/:date", get(brief))
-        .route("/onboarding", get(onboarding))
-        .route("/api/interview", post(interview_turn))
-        .route("/api/objectives", post(save_objective_items))
         .route("/api/browsing", post(add_browsing))
-        .route("/log", get(log))
-        .route("/feedback", get(feedback_page))
-        .route("/objectives", get(objectives).post(save_objectives))
         .route("/api/feedback", post(add_feedback))
         .route("/api/generate", post(start_generate))
         .route("/api/status", get(status))
@@ -235,32 +229,6 @@ async fn brief(State(app): S, Path(date): Path<String>) -> Response {
     }
 }
 
-async fn onboarding(State(app): S) -> Html<String> {
-    Html(html::onboarding(&app.store.objective_list()))
-}
-
-/// One turn of the objectives interview: the conversation so far in, Claude's next message out.
-async fn interview_turn(State(app): S, Json(t): Json<interview::Transcript>) -> Response {
-    match interview::turn(&app.store, &t).await {
-        Ok(reply) => Json(reply).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct ObjectiveItems {
-    objectives: Vec<interview::Objective>,
-}
-
-/// Save the objectives the interview proposed (after the user's edits), in rank order.
-async fn save_objective_items(State(app): S, Json(o): Json<ObjectiveItems>) -> StatusCode {
-    let items: Vec<String> = o.objectives.iter().filter(|o| !o.title.trim().is_empty()).enumerate().map(|(i, o)| o.to_item(i + 1)).collect();
-    match app.store.save_objective_list(&items) {
-        Ok(()) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
 #[derive(Deserialize)]
 struct BrowsingIn {
     #[serde(default)]
@@ -277,41 +245,6 @@ async fn add_browsing(State(app): S, headers: HeaderMap, Json(b): Json<BrowsingI
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     Json(serde_json::json!({ "build": browsing::build(), "installed_build": browsing::installed_build(&app.store) })).into_response()
-}
-
-#[derive(Deserialize)]
-struct LogQuery {
-    project: Option<String>,
-}
-
-async fn log(State(app): S, Query(q): Query<LogQuery>) -> Html<String> {
-    Html(html::log(&app.store.entries(), q.project.as_deref()))
-}
-
-async fn feedback_page(State(app): S) -> Html<String> {
-    // Keep only the latest feedback per item.
-    let mut latest: Vec<Feedback> = Vec::new();
-    for f in app.store.feedback() {
-        latest.retain(|x| !(x.brief_date == f.brief_date && x.item_id == f.item_id));
-        latest.push(f);
-    }
-    Html(html::feedback_page(&latest))
-}
-
-async fn objectives(State(app): S) -> Html<String> {
-    Html(html::objectives(&app.store.objectives()))
-}
-
-#[derive(Deserialize)]
-struct ObjectivesForm {
-    text: String,
-}
-
-async fn save_objectives(State(app): S, Form(f): Form<ObjectivesForm>) -> Response {
-    match app.store.save_objectives(&f.text.replace("\r\n", "\n")) {
-        Ok(()) => Redirect::to("/objectives").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
 }
 
 #[derive(Deserialize)]

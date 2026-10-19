@@ -24,7 +24,6 @@ const GOOD: Color = Color::Indexed(114);
 const BAD: Color = Color::Indexed(203);
 const BANNER_COLORS: [u8; 6] = [202, 202, 208, 208, 214, 214];
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const MODELS: [&str; 3] = ["opus", "sonnet", "haiku"];
 
 const BANNER: [&str; 6] = [
     "██████╗ ██████╗ ██╗███████╗███████╗",
@@ -112,6 +111,12 @@ struct Status {
 
 type Job = mpsc::Receiver<Result<String, String>>;
 
+/// Why the app closed: to quit, or to run the objectives interview in the terminal and come back.
+pub enum Exit {
+    Quit,
+    Interview,
+}
+
 struct App {
     store: Store,
     rt: tokio::runtime::Handle,
@@ -134,9 +139,10 @@ struct App {
     settings_row: usize,
     csel: usize,
     job: Option<(Conn, Job)>,
+    exit: Exit,
 }
 
-pub fn run(store: Store, start_in_editor: bool) -> Result<()> {
+pub fn run(store: Store) -> Result<Exit> {
     let mut app = App {
         store,
         rt: tokio::runtime::Handle::current(),
@@ -157,13 +163,11 @@ pub fn run(store: Store, start_in_editor: bool) -> Result<()> {
         settings_row: 0,
         csel: 0,
         job: None,
+        exit: Exit::Quit,
     };
     app.refresh();
-    if start_in_editor || app.status.goals == 0 {
+    if app.status.goals == 0 {
         app.open_objectives();
-        if app.status.server_up {
-            app.open_interview();
-        }
     }
     let mut terminal = ratatui::init();
     // Alternate scroll mode: the mouse wheel arrives as ↑/↓ keys, without capturing
@@ -172,7 +176,7 @@ pub fn run(store: Store, start_in_editor: bool) -> Result<()> {
     let result = app.event_loop(&mut terminal);
     let _ = std::io::stdout().write_all(b"\x1b[?1007l").and_then(|_| std::io::stdout().flush());
     ratatui::restore();
-    result
+    result.map(|()| app.exit)
 }
 
 impl App {
@@ -278,7 +282,7 @@ impl App {
                 Some(h) => h.clone(),
                 None => "not written yet · opens your past briefs".into(),
             }),
-            (Action::Generate, "Write today's brief now".into(), "1–3 minutes, uses your Claude subscription".into()),
+            (Action::Generate, "Write today's brief now".into(), format!("a few minutes, with {}", crate::agent::Agent::from_id(&cfg.agent).name())),
             (Action::Objectives, "Objectives".into(), match s.goals {
                 0 => "not set yet · start here".into(),
                 1 => "1 objective".into(),
@@ -289,7 +293,10 @@ impl App {
                 0 => "nothing connected yet".into(),
                 n => format!("{n} connected"),
             }),
-            (Action::Settings, "Settings".into(), format!("brief at {:02}:00 · {}", cfg.brief_hour, cfg.model)),
+            (Action::Settings, "Settings".into(), {
+                let agent = crate::agent::Agent::from_id(&cfg.agent);
+                format!("brief at {:02}:00 · {} · {}", cfg.brief_hour, agent.name(), agent.model_label(&cfg.model))
+            }),
             (Action::Service, if s.service_installed { "Stop running in background".into() } else { "Run in background".into() },
                 if s.service_installed { "removes the login item".into() } else { "starts at login, writes the brief daily".into() }),
             (Action::Quit, "Quit".into(), String::new()),
@@ -309,7 +316,7 @@ impl App {
         match self.screen {
             Screen::Home => return self.home_key(k),
             Screen::Objectives if self.editing => self.edit_key(k),
-            Screen::Objectives => self.objectives_key(k),
+            Screen::Objectives => return self.objectives_key(k),
             Screen::Connect => self.connect_key(k),
             Screen::Journal => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => self.screen = Screen::Home,
@@ -415,15 +422,6 @@ impl App {
         }
     }
 
-    /// The objectives interview runs on the briefs website, where it can be a real conversation.
-    fn open_interview(&mut self) {
-        if self.status.server_up {
-            connect::open(&format!("http://127.0.0.1:{}/onboarding", self.store.config().port));
-            self.say("The interview opened in your browser. Your objectives here update when you save there.", false);
-        } else {
-            self.say("The interview needs the background service: Home → start it, or run `brief init`.", true);
-        }
-    }
 
     fn save_objectives(&mut self) {
         let items: Vec<String> = self.objs.iter().map(Editor::text).collect();
@@ -460,7 +458,8 @@ impl App {
         }
     }
 
-    fn objectives_key(&mut self, k: KeyEvent) {
+    /// Returns false to leave the app (for the interview).
+    fn objectives_key(&mut self, k: KeyEvent) -> bool {
         let n = self.objs.len();
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
@@ -489,7 +488,11 @@ impl App {
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('a') | KeyCode::Char('o') => self.add_objective((self.osel + 1).min(n)),
-            KeyCode::Char('i') => self.open_interview(),
+            KeyCode::Char('i') => {
+                self.save_objectives();
+                self.exit = Exit::Interview;
+                return false;
+            }
             KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace if self.osel < n => {
                 let gone = self.objs.remove(self.osel);
                 self.deleted = Some((self.osel, gone.text()));
@@ -508,6 +511,7 @@ impl App {
             }
             _ => {}
         }
+        true
     }
 
     fn edit_key(&mut self, k: KeyEvent) {
@@ -702,8 +706,9 @@ impl App {
         match self.settings_row {
             0 => cfg.brief_hour = (cfg.brief_hour as i32 + delta).rem_euclid(24) as u32,
             _ => {
-                let i = MODELS.iter().position(|m| *m == cfg.model).unwrap_or(0) as i32;
-                cfg.model = MODELS[(i + delta).rem_euclid(MODELS.len() as i32) as usize].into();
+                let models = crate::agent::Agent::from_id(&cfg.agent).models();
+                let i = models.iter().position(|m| m.id == cfg.model).unwrap_or(0) as i32;
+                cfg.model = models[(i + delta).rem_euclid(models.len() as i32) as usize].id.into();
             }
         }
         match self.store.save_config(&cfg) {
@@ -739,7 +744,7 @@ impl App {
         let keys: &[(&str, &str)] = match self.screen {
             Screen::Home => &[("↑↓", "move"), ("⏎", "select"), ("1-8", "jump"), ("q", "quit")],
             Screen::Objectives if self.editing => &[("esc", "done"), ("⏎", "next objective"), ("⌥⏎", "line break"), ("↑↓", "move"), ("⌥⌫", "del word")],
-            Screen::Objectives => &[("↑↓", "move"), ("⏎", "edit"), ("n", "new"), ("d", "delete"), ("⇧↑↓", "reorder"), ("esc", "back")],
+            Screen::Objectives => &[("↑↓", "move"), ("⏎", "edit"), ("n", "new"), ("d", "delete"), ("⇧↑↓", "reorder"), ("i", "interview"), ("esc", "back")],
             Screen::Settings => &[("↑↓", "choose"), ("←→", "change"), ("esc", "back")],
             Screen::Connect => &[("↑↓", "move"), ("⏎", "connect / disconnect"), ("c", "copy link"), ("esc", "back")],
             Screen::Journal => &[("↑↓", "scroll"), ("space", "page"), ("g/G", "top/bottom"), ("esc", "back")],
@@ -806,7 +811,7 @@ impl App {
         let service = if s.server_up {
             row(Some(true), "background", format!("running · http://127.0.0.1:{}", cfg.port), plain)
         } else if s.service_installed {
-            row(Some(false), "background", "installed but not responding · see ~/.brief/logs".into(), Style::default().fg(BAD))
+            row(Some(false), "background", format!("installed but not responding · see {}", self.store.root.join("logs").display()), Style::default().fg(BAD))
         } else {
             row(Some(false), "background", "not running".into(), Style::default().fg(DIM))
         };
@@ -861,7 +866,7 @@ impl App {
         f.render_widget(screen_title("Objectives"), title);
         f.render_widget(
             Paragraph::new(Line::styled(
-                "One box per objective. First line is the goal; add notes underneath with ⌥⏎. Press i to let Claude interview you instead.",
+                "One box per objective. First line is the goal; add notes underneath with ⌥⏎. Press i to talk them through with your agent instead.",
                 Style::default().fg(DIM),
             ))
             .wrap(Wrap { trim: true }),
@@ -1162,9 +1167,10 @@ impl App {
         let [title, body] = Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
         f.render_widget(screen_title("Settings"), title);
         let cfg = self.store.config();
+        let agent = crate::agent::Agent::from_id(&cfg.agent);
         let rows = [
             ("Write the brief after", format!("{:02}:00", cfg.brief_hour), "local time; catches up if your Mac was asleep"),
-            ("Claude model", cfg.model.clone(), "opus is best; sonnet and haiku are lighter on your usage"),
+            ("Model", agent.model_label(&cfg.model), "the first one is the recommended one; `brief init` changes the agent"),
         ];
         let mut lines = Vec::new();
         for (i, (label, value, hint)) in rows.iter().enumerate() {
@@ -1174,7 +1180,7 @@ impl App {
                 Span::styled(if on { " › " } else { "   " }, Style::default().fg(ACCENT)),
                 Span::styled(format!("{label:<24}"), if on { Style::default().bold() } else { Style::default() }),
                 Span::styled("‹ ", arrow),
-                Span::styled(format!("{value:^8}"), if on { Style::default().fg(ACCENT).bold() } else { Style::default() }),
+                Span::styled(format!("{value:^20}"), if on { Style::default().fg(ACCENT).bold() } else { Style::default() }),
                 Span::styled(" ›", arrow),
             ]));
             lines.push(Line::styled(format!("   {hint}"), Style::default().fg(DIM)));

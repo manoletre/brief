@@ -1,3 +1,4 @@
+mod agent;
 mod anki;
 mod browsing;
 mod calendar;
@@ -10,6 +11,7 @@ mod interview;
 mod macapp;
 mod mcp;
 mod oauth;
+mod onboard;
 mod server;
 mod store;
 mod todoist;
@@ -30,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Set your objectives: Claude interviews you in the browser (the app's editor is there too).
+    /// Set up brief in the terminal: your agent, your objectives, what brief reads, a first brief.
     Init,
     /// Run the background server: MCP over HTTP, the briefs website, and the daily scheduler.
     Serve,
@@ -80,31 +82,24 @@ async fn main() -> Result<()> {
     let store = Store::open()?;
     let cmd = match Cli::parse().cmd {
         Some(cmd) => cmd,
-        None if std::io::stdout().is_terminal() => return app(store, false).await,
+        None if std::io::stdout().is_terminal() => {
+            if !store.config().onboarded && store.objective_list().is_empty() {
+                let s = store.clone();
+                tokio::task::spawn_blocking(move || onboard::run(s)).await??;
+            }
+            return app(store).await;
+        }
         None => {
             <Cli as clap::CommandFactory>::command().print_help()?;
             return Ok(());
         }
     };
     match cmd {
-        Cmd::Init => {
-            // The interview runs on the briefs website; serve it from here if the service is off.
-            let port = store.config().port;
-            if !server_up(port) {
-                tokio::spawn(server::serve(store.clone()));
-                for _ in 0..20 {
-                    if server_up(port) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-            app(store, true).await
-        }
+        Cmd::Init => tokio::task::spawn_blocking(move || onboard::run(store)).await?,
         Cmd::Serve => server::serve(store).await,
         Cmd::Mcp => mcp::run_stdio(store).await,
         Cmd::Generate => {
-            eprintln!("Asking Claude to write today's brief (this can take a few minutes)…");
+            eprintln!("Asking {} to write today's brief (this can take a few minutes)…", agent::configured(&store).0.name());
             let b = generate::generate(&store).await?;
             println!("{}", b.headline);
             println!("Open http://127.0.0.1:{}/brief/{}", store.config().port, b.date.unwrap());
@@ -221,8 +216,18 @@ async fn connected_app(store: Store, app: App, action: Option<String>) -> Result
     Ok(())
 }
 
-async fn app(store: Store, start_in_editor: bool) -> Result<()> {
-    tokio::task::spawn_blocking(move || tui::run(store, start_in_editor)).await?
+/// The terminal app. Its objectives screen hands the terminal to the interview and comes back.
+async fn app(store: Store) -> Result<()> {
+    loop {
+        let s = store.clone();
+        match tokio::task::spawn_blocking(move || tui::run(s)).await?? {
+            tui::Exit::Quit => return Ok(()),
+            tui::Exit::Interview => {
+                let s = store.clone();
+                tokio::task::spawn_blocking(move || onboard::interview_only(s)).await??;
+            }
+        }
+    }
 }
 
 fn edit_objectives(store: &Store) -> Result<()> {
@@ -235,7 +240,7 @@ fn edit_objectives(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn server_up(port: u16) -> bool {
+pub fn server_up(port: u16) -> bool {
     std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), std::time::Duration::from_millis(80)).is_ok()
 }
 
@@ -259,7 +264,7 @@ fn gui_domain() -> Result<String> {
 }
 
 pub fn restart_service() -> Result<()> {
-    let out = std::process::Command::new("launchctl").args(["kickstart", "-k", &format!("{}/{PLIST_LABEL}", gui_domain()?)]).output()?;
+    let out = std::process::Command::new("launchctl").args(["kickstart", "-k", &format!("{}/{}", gui_domain()?, plist_label())]).output()?;
     anyhow::ensure!(out.status.success(), "couldn't restart the service: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
 }
@@ -298,29 +303,46 @@ Tip: the tool descriptions ask assistants to log proactively, but adding
     )
 }
 
-const PLIST_LABEL: &str = "com.brief.serve";
+/// The launchd label. A store moved with BRIEF_HOME gets its own service (e.g. com.brief.serve.brieff
+/// for ~/.brieff), so two stores never fight over one agent.
+fn plist_label() -> String {
+    let Some(home) = std::env::var_os("BRIEF_HOME") else { return "com.brief.serve".into() };
+    let name: String = std::path::Path::new(&home)
+        .file_name()
+        .map(|n| n.to_string_lossy().trim_start_matches('.').to_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    format!("com.brief.serve.{}", if name.is_empty() { "custom" } else { &name })
+}
 
 pub fn plist_path() -> Result<std::path::PathBuf> {
-    Ok(dirs::home_dir().context("no home")?.join(format!("Library/LaunchAgents/{PLIST_LABEL}.plist")))
+    Ok(dirs::home_dir().context("no home")?.join(format!("Library/LaunchAgents/{}.plist", plist_label())))
 }
 
 pub fn install(store: &Store) -> Result<String> {
     let path = plist_path()?;
     let logs = store.root.join("logs");
     let env_path = std::env::var("PATH").unwrap_or_default();
+    // The service must open the same store as the app that installed it.
+    let env_home = std::env::var_os("BRIEF_HOME")
+        .map(|_| format!("<key>BRIEF_HOME</key><string>{}</string>", html::esc(&store.root.display().to_string())))
+        .unwrap_or_default();
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>{PLIST_LABEL}</string>
+  <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key><array><string>{exe}</string><string>serve</string></array>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string>{env_home}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>{out}</string>
   <key>StandardErrorPath</key><string>{err}</string>
 </dict></plist>
 "#,
+        label = plist_label(),
         exe = html::esc(&exe()),
         path = html::esc(&env_path),
         out = html::esc(&logs.join("serve.log").display().to_string()),

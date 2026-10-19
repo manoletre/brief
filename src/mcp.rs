@@ -63,7 +63,7 @@ done) when the user asks, or after proposing it, e.g. a next step that came out 
 yes; never on your own. A to-do is something still to do; what was done or decided goes to `log_work`.";
 
 pub const ICON_SVG: &str = include_str!("../assets/icon.svg");
-pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon-3d.png");
 
 const KINDS: &[&str] = &["progress", "decision", "idea", "question", "blocker", "learning", "note"];
 

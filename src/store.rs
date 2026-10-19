@@ -1,6 +1,6 @@
 //! Plain-file storage under ~/.brief (override with BRIEF_HOME).
 //!
-//!   config.json        port, brief hour, model, optional access key
+//!   config.json        port, brief hour, agent and model, optional access key
 //!   objectives.md      your goals, written at `brief init`
 //!   entries.jsonl      everything your chatbots logged via MCP
 //!   feedback.jsonl     your reactions to brief items
@@ -27,8 +27,17 @@ pub struct Config {
     pub port: u16,
     /// Local hour (0-23) after which the daily brief is generated.
     pub brief_hour: u32,
-    /// Model alias passed to `claude --model`.
+    /// The agent CLI that interviews the user and writes the brief: claude, codex, cline or opencode.
+    #[serde(default = "default_agent")]
+    pub agent: String,
+    /// Model passed to the agent ("" for the agent's own default).
     pub model: String,
+    /// Onboarding (`brief init`) has been finished or skipped through.
+    #[serde(default)]
+    pub onboarded: bool,
+    /// The user signed in to Composio, so the brief writer may read their apps with its CLI.
+    #[serde(default)]
+    pub composio: bool,
     /// When set, HTTP MCP requests must carry `?key=` or `Authorization: Bearer`.
     /// Needed only if you expose the server through a tunnel.
     #[serde(default)]
@@ -43,6 +52,10 @@ pub struct Config {
     /// Model alias for the reviewer that checks every Anki card before it's added.
     #[serde(default = "default_anki_model")]
     pub anki_model: String,
+}
+
+fn default_agent() -> String {
+    "claude".into()
 }
 
 fn default_anki_model() -> String {
@@ -61,7 +74,10 @@ impl Default for Config {
         Config {
             port: 7878,
             brief_hour: 7,
+            agent: default_agent(),
             model: "opus".into(),
+            onboarded: false,
+            composio: false,
             access_key: None,
             tunnel: false,
             public_url: None,

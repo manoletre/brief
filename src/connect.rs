@@ -74,6 +74,81 @@ pub fn set_claude_code(on: bool) -> Result<String> {
     }
 }
 
+// ── Codex, Cline, OpenCode ───────────────────────────────────
+
+fn codex_config() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".codex/config.toml"))
+}
+
+pub fn codex_connected() -> bool {
+    codex_config().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|t| t.contains("[mcp_servers.brief]"))
+}
+
+pub fn set_codex(on: bool) -> Result<String> {
+    let codex = crate::agent::Agent::Codex.find().context("Codex isn't installed")?;
+    let _ = Command::new(&codex).args(["mcp", "remove", "brief"]).output();
+    if on {
+        run(Command::new(&codex).args(["mcp", "add", "brief", "--"]).arg(stable_exe()).arg("mcp"))?;
+        Ok("Connected to Codex. New Codex sessions will log to brief.".into())
+    } else {
+        Ok("Disconnected from Codex.".into())
+    }
+}
+
+fn cline_config() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".cline/data/settings/cline_mcp_settings.json"))
+}
+
+pub fn cline_connected() -> bool {
+    cline_config().and_then(|p| read_json(&p)).is_some_and(|v| v.pointer("/mcpServers/brief").is_some())
+}
+
+pub fn set_cline(on: bool) -> Result<String> {
+    let path = cline_config().context("no home directory")?;
+    let entry = json!({ "command": stable_exe(), "args": ["mcp"], "disabled": false });
+    edit_json(&path, "mcpServers", on.then_some(entry))?;
+    Ok(if on { "Connected to Cline. New Cline tasks will log to brief." } else { "Disconnected from Cline." }.into())
+}
+
+fn opencode_config() -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".config/opencode/opencode.json"))
+}
+
+pub fn opencode_connected() -> bool {
+    opencode_config().and_then(|p| read_json(&p)).is_some_and(|v| v.pointer("/mcp/brief").is_some())
+}
+
+pub fn set_opencode(on: bool) -> Result<String> {
+    let path = opencode_config().context("no home directory")?;
+    let entry = json!({ "type": "local", "command": [stable_exe(), "mcp"], "enabled": true });
+    edit_json(&path, "mcp", on.then_some(entry))?;
+    Ok(if on { "Connected to OpenCode. New OpenCode sessions will log to brief." } else { "Disconnected from OpenCode." }.into())
+}
+
+/// Set (or remove, with None) `<section>.brief` in a JSON config file, keeping a .bak of the original.
+fn edit_json(path: &Path, section: &str, entry: Option<Value>) -> Result<()> {
+    let original = std::fs::read_to_string(path).unwrap_or_default();
+    let mut cfg: Value = if original.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&original).with_context(|| format!("{} isn't plain JSON; add brief there by hand", path.display()))?
+    };
+    let servers = cfg.as_object_mut().context("config isn't a JSON object")?.entry(section).or_insert_with(|| json!({}));
+    let servers = servers.as_object_mut().with_context(|| format!("`{section}` in {} isn't an object", path.display()))?;
+    match entry {
+        Some(e) => servers.insert("brief".into(), e),
+        None => servers.remove("brief"),
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if !original.is_empty() {
+        std::fs::write(path.with_extension("json.bak"), &original)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&cfg)? + "\n")?;
+    Ok(())
+}
+
 // ── Claude Desktop ───────────────────────────────────────────
 
 fn desktop_config() -> Option<PathBuf> {

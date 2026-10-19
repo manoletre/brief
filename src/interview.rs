@@ -1,18 +1,21 @@
-//! The objectives interview (/onboarding): instead of a blank list, Claude asks about what you're
-//! working towards one question at a time (why it matters, what done looks like, by when, how
-//! much time it gets, what's in the way, how the goals rank) and then writes objectives the brief
-//! can actually prioritise against. Each turn is one `claude -p` call with the whole conversation.
+//! The objectives interview (`brief init`, in the terminal): the user's agent asks about what
+//! they're working towards one question at a time and then writes objectives, short and long term,
+//! the brief can actually hold them to. Each turn is one headless agent run with the whole
+//! conversation (see agent.rs).
+//!
+//! The shape follows Schimpf, Voigt & Bohné, "AI-Assisted Goal Setting Improves Goal Progress
+//! Through Social Accountability" (arXiv:2603.17887): a named coach, four phases (background,
+//! what energises them, priorities, goals formulated together), a should-versus-want check, and an
+//! explicit invitation to follow-up. Its finding is that the gain over a written questionnaire
+//! comes from feeling accountable to someone who will check back, so the interview says plainly
+//! that brief will.
 
 use crate::store::Store;
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fmt::Write as _;
-use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Default)]
 pub struct Transcript {
     #[serde(default)]
     pub messages: Vec<Message>,
@@ -39,6 +42,9 @@ pub struct Reply {
 #[derive(Serialize, Deserialize, Default)]
 pub struct Objective {
     pub title: String,
+    /// "short" (the next few weeks) or "long" (months to a year or more).
+    #[serde(default)]
+    pub horizon: String,
     #[serde(default)]
     pub why: String,
     #[serde(default)]
@@ -57,7 +63,12 @@ impl Objective {
     /// As stored in objectives.md: the goal, then one indented line per detail.
     pub fn to_item(&self, rank: usize) -> String {
         let mut s = format!("{}\nPriority: {rank}", self.title.trim());
-        for (label, v) in [("Why", &self.why), ("Done when", &self.done_when), ("Deadline", &self.deadline), ("Time", &self.time), ("In the way", &self.obstacles), ("Notes", &self.notes)] {
+        let horizon = match self.horizon.trim() {
+            "short" => "short term".to_owned(),
+            "long" => "long term".to_owned(),
+            other => other.to_owned(),
+        };
+        for (label, v) in [("Horizon", &horizon), ("Why", &self.why), ("Done when", &self.done_when), ("Deadline", &self.deadline), ("Time", &self.time), ("In the way", &self.obstacles), ("Notes", &self.notes)] {
             if !v.trim().is_empty() {
                 let _ = write!(s, "\n{label}: {}", v.trim().replace('\n', " "));
             }
@@ -66,38 +77,48 @@ impl Objective {
     }
 }
 
-const GUIDE: &str = r#"You are onboarding the user to brief, a personal assistant that writes them a daily brief. Every
-morning the brief compares where their time actually went (calendar, browser, what they logged from
-chatbots, to-do list) against their objectives, and helps them reprioritise. So the objectives must
-be specific enough to judge a day against. Interview them to get there.
+const GUIDE: &str = r#"You are brief, the user's accountability partner. brief is a shared memory: the AI tools
+they use every day log what they work on, and every morning brief reads that log, their calendar,
+to-do list, browser and meeting notes, compares it with their objectives and writes them a short
+brief: what to do more of, less of, stop or move. You're starting with them now: find out what
+they're really working towards so every brief can hold them to it. Short-term objectives (the next
+2-6 weeks) and long-term ones (6 months to a few years), and how the short ones feed the long ones.
 
-How to interview:
-- One question per message. Short and warm, plain words, no lists of questions. Under 45 words.
-- Start broad: everything they're working towards right now (work, job search, learning, side
-  projects, health, people). Then go objective by objective.
-- For each objective find out: why it matters to them (the real reason, dig once if the answer is
-  vague); what "done" or success looks like, ideally something you could check; a deadline or
-  time frame; how many hours a week they want it to get, and roughly how much it really gets now;
-  what's in the way.
-- Then ask them to rank the objectives against each other, and whether anything they spend time
-  on serves none of them (and should get less).
-- Reflect back briefly when it helps ("So the Liquid application is the real goal and the chess
-  project is a way to show post-training skill?"), and push back gently on goals that are vague
-  or too many for the hours they have.
+Move through four phases, in order, but keep it a conversation, not a form:
+1. Background. Where they are right now: what they do, what they're in the middle of, what changed
+   lately. One or two questions.
+2. Energy. What they've enjoyed or felt energised by lately, and what drains them. This is what
+   tells real goals from obligations.
+3. Priorities. What matters most to them over the next year or two (the long term), and what has to
+   happen in the next few weeks (the short term). What's competing for their time.
+4. Goals, together. Turn it into 2-5 objectives with them. For each: what done looks like (checkable),
+   a deadline, how many hours a week it should get (and roughly gets now), and what's in the way.
+   Do a should-versus-want check: "is this something you want, or something you feel you should
+   do?" Gently question a "should" goal; keep it only if they still choose it. Then have them rank
+   the objectives.
+
+How to talk:
+- One question per message. Short and warm, plain words, under 45 words. Follow up on what they
+  actually said (contingent questions), dig once when an answer is vague.
+- Reflect back briefly when it helps, and push back gently on goals that are vague, or too many
+  for the hours they have.
+- Never impose goals. If they push back on a framing, follow their lead, but still aim for goals
+  that feel personally meaningful to them.
 - If they already have objectives (given below), don't start from zero: confirm and sharpen them,
   ask only about what's missing.
-- About 8-14 questions in total. Don't drag it out; stop once you could judge their day.
-- `suggestions`: 0-4 short likely answers they can tap (each under 8 words), only when a question
-  has obvious options (e.g. a ranking, yes/no, hours). Never for open questions.
+- About 8-12 questions in total. Stop once you could judge their day against the goals.
+- `suggestions`: 0-4 short likely answers they can pick (each under 8 words), only when a question
+  has obvious options (a ranking, yes/no, hours). Never for open questions.
 
-When you have enough, reply with a short closing message and the objectives, best first, in
-their words where possible. Each field one short sentence; leave a field empty if they didn't say.
-If they then ask for changes, reply with the full corrected list again.
+When you have enough, reply with a short closing message that asks them to commit ("Can I hold you
+to these?") and says you'll check back on them in every morning's brief, plus the objectives, best
+first, in their words where possible. Each field one short sentence; leave a field empty if they
+didn't say. If they then ask for changes, reply with the full corrected list again.
 
-Reply with ONLY a JSON object, no prose before or after:
+Reply with ONLY a JSON object, no prose before or after, no code fences:
 {"message": "...", "suggestions": [], "objectives": []}
 where each objective is
-{"title": "at most 12 words", "why": "", "done_when": "", "deadline": "", "time": "e.g. 10h/week (now ~4h)", "obstacles": "", "notes": ""}
+{"title": "at most 12 words", "horizon": "short | long", "why": "", "done_when": "", "deadline": "", "time": "e.g. 10h/week (now ~4h)", "obstacles": "", "notes": ""}
 and "objectives" stays empty until you're proposing them."#;
 
 pub async fn turn(store: &Store, t: &Transcript) -> Result<Reply> {
@@ -114,33 +135,15 @@ pub async fn turn(store: &Store, t: &Transcript) -> Result<Reply> {
     }
     prompt.push_str("\n\n# The conversation so far\n\n");
     if t.messages.is_empty() {
-        prompt.push_str("(Nothing yet: write your opening message. Say in one sentence what this is for, then ask the first question.)\n");
+        prompt.push_str("(Nothing yet: write your opening message. Introduce yourself as brief in one sentence, say this takes about ten minutes, then ask the first background question.)\n");
     }
     for m in &t.messages {
         let who = if m.role == "user" { "User" } else { "You" };
         let _ = writeln!(prompt, "{who}: {}\n", m.text.trim());
     }
 
-    let claude = crate::generate::find_claude().context("could not find the `claude` CLI; install Claude Code or put it on PATH")?;
-    let mut child = Command::new(claude)
-        .args(["-p", "--output-format", "json", "--model", "sonnet", "--tools", ""])
-        .current_dir(store.root.join("work"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to start claude")?;
-    child.stdin.take().unwrap().write_all(prompt.as_bytes()).await?;
-    let out = tokio::time::timeout(std::time::Duration::from_secs(180), child.wait_with_output()).await.context("claude timed out")??;
-    if !out.status.success() {
-        bail!("claude exited with {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
-    }
-    let envelope: Value = serde_json::from_slice(&out.stdout).context("unexpected output from claude")?;
-    let text = envelope.get("result").and_then(Value::as_str).unwrap_or_default();
-    let json = match (text.find('{'), text.rfind('}')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => "",
-    };
-    Ok(serde_json::from_str(json).unwrap_or_else(|_| Reply { message: text.trim().to_owned(), ..Default::default() }))
+    let (agent, model) = crate::agent::configured(store);
+    let reply = agent.ask(store, &model, &prompt, crate::agent::Tools::None, std::time::Duration::from_secs(240)).await?;
+    let text = reply.text.trim();
+    Ok(serde_json::from_str(crate::agent::json_object(text)).unwrap_or_else(|_| Reply { message: text.to_owned(), ..Default::default() }))
 }

@@ -1,6 +1,6 @@
 //! Server-rendered pages. No JS framework; a little inline JS posts feedback.
 
-use crate::store::{Brief, Entry, Feedback, Store};
+use crate::store::{Brief, Feedback, Store};
 use chrono::NaiveDate;
 use pulldown_cmark::{html::push_html, Event, Options, Parser};
 use std::collections::HashMap;
@@ -25,20 +25,15 @@ fn safe_url(u: &str) -> String {
     if u.starts_with("https://") || u.starts_with("http://") { esc(u) } else { "#".into() }
 }
 
-fn layout(title: &str, active: &str, body: &str) -> String {
-    let nav = [("/", "Briefs"), ("/log", "Journal"), ("/feedback", "Feedback"), ("/objectives", "Objectives")]
-        .iter()
-        .map(|(href, label)| {
-            let cls = if *label == active { " class=\"on\"" } else { "" };
-            format!("<a href=\"{href}\"{cls}>{label}</a>")
-        })
-        .collect::<String>();
+/// The website only shows the briefs; everything else (objectives, journal, connections) is in
+/// the terminal app.
+fn layout(title: &str, body: &str) -> String {
     format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="/icon.svg"><link rel="apple-touch-icon" href="/icon.png">
+<link rel="icon" type="image/png" href="/icon.png"><link rel="apple-touch-icon" href="/icon.png">
 <title>{title}</title><style>{CSS}</style></head>
-<body><header><a class="brand" href="/"><img src="/icon.svg" alt="">brief</a><nav>{nav}</nav></header>
+<body><header><a class="brand" href="/"><img src="/icon.png" alt="">brief</a><nav><a href="/" class="on">Briefs</a></nav></header>
 <main>{body}</main><script>{JS}</script></body></html>"#,
         title = esc(title)
     )
@@ -64,7 +59,7 @@ pub fn index(store: &Store, generating: bool, last_error: Option<&str>) -> Strin
         let _ = write!(b, "<p class=\"err\">Last generation failed: {}</p>", esc(err));
     }
     if store.objectives().trim().is_empty() {
-        b.push_str("<p class=\"note\">You haven't set objectives yet. <a href=\"/onboarding\">Let Claude interview you</a> so the brief knows what you're working towards.</p>");
+        b.push_str("<p class=\"note\">You haven't set objectives yet. Run <code>brief init</code> in your terminal so the brief knows what you're working towards.</p>");
     }
 
     let dates = store.brief_dates();
@@ -88,7 +83,7 @@ pub fn index(store: &Store, generating: bool, last_error: Option<&str>) -> Strin
         );
     }
     b.push_str("</ul>");
-    layout("Daily briefs", "Briefs", &b)
+    layout("Daily briefs", &b)
 }
 
 /// One line of markdown without the wrapping paragraph.
@@ -299,7 +294,7 @@ pub fn brief(brief: &Brief, feedback: &[Feedback], older: Option<NaiveDate>, new
         let _ = write!(b, "<p class=\"muted small\">Generated with Claude Code · ${c:.2} equivalent usage</p>");
     }
     b.push_str("</section></div><div class=\"decknav\"><button class=\"prev\">← Back</button><span class=\"muted small hint\">← → keys</span><button class=\"next primary\">Next →</button></div></div>");
-    layout(&brief.headline, "Briefs", &b)
+    layout(&brief.headline, &b)
 }
 
 fn feedback_controls(existing: Option<&Feedback>, label: &str) -> String {
@@ -315,106 +310,6 @@ fn feedback_controls(existing: Option<&Feedback>, label: &str) -> String {
         if rating == "down" { " sel" } else { "" },
         esc(comment)
     )
-}
-
-pub fn log(entries: &[Entry], project: Option<&str>) -> String {
-    let mut projects: Vec<&str> = entries.iter().map(|e| e.project.as_str()).collect();
-    projects.sort_unstable();
-    projects.dedup();
-
-    let mut b = String::from("<h1>Journal</h1><p class=\"muted\">Everything your chatbots have logged.</p><p class=\"chips\">");
-    let _ = write!(b, "<a href=\"/log\" class=\"chip{}\">all</a>", if project.is_none() { " on" } else { "" });
-    for p in &projects {
-        let on = if project == Some(*p) { " on" } else { "" };
-        let _ = write!(b, "<a href=\"/log?project={}\" class=\"chip{on}\">{}</a>", esc(&url_encode(p)), esc(p));
-    }
-    b.push_str("</p>");
-    let shown: Vec<_> = entries.iter().rev().filter(|e| project.map_or(true, |p| e.project == p)).collect();
-    if shown.is_empty() {
-        b.push_str("<p class=\"muted\">Nothing logged yet. Connect a chatbot with <code>brief connect</code>.</p>");
-    }
-    let mut day = String::new();
-    for e in shown {
-        let d = e.ts.format("%A, %B %-d").to_string();
-        if d != day {
-            let _ = write!(b, "<h3 class=\"day\">{d}</h3>");
-            day = d;
-        }
-        let _ = write!(
-            b,
-            "<div class=\"entry\"><div class=\"meta\"><span class=\"proj\">{0}</span><span class=\"kind k-{1}\">{1}</span>\
-             <span class=\"muted small\">{2} · via {3}</span></div><p>{4}</p>",
-            esc(&e.project),
-            esc(&e.kind),
-            e.ts.format("%H:%M"),
-            esc(&e.source),
-            esc(&e.summary)
-        );
-        if !e.details.is_empty() {
-            let _ = write!(b, "<details><summary>details</summary>{}</details>", md(&e.details));
-        }
-        b.push_str("</div>");
-    }
-    layout("Journal", "Journal", &b)
-}
-
-pub fn feedback_page(feedback: &[Feedback]) -> String {
-    let mut b = String::from("<h1>Your feedback</h1><p class=\"muted\">Fed into every new brief so it learns what is useful to you.</p>");
-    if feedback.is_empty() {
-        b.push_str("<p class=\"muted\">No feedback yet. Rate items inside a brief.</p>");
-    }
-    b.push_str("<ul class=\"menu\">");
-    for f in feedback.iter().rev() {
-        let icon = match f.rating.as_str() {
-            "up" => "👍",
-            "down" => "👎",
-            _ => "💬",
-        };
-        let title = if f.item_title.is_empty() { "Whole brief" } else { &f.item_title };
-        let _ = write!(
-            b,
-            "<li><a href=\"/brief/{}\"><span class=\"date\">{icon} {}</span><span class=\"head\">{}</span><span class=\"muted small\">{}</span></a></li>",
-            f.brief_date,
-            f.brief_date.format("%b %-d"),
-            esc(title),
-            esc(&f.comment)
-        );
-    }
-    b.push_str("</ul>");
-    layout("Feedback", "Feedback", &b)
-}
-
-/// The objectives interview: a chat with Claude that ends in a list of objectives to edit and save.
-pub fn onboarding(existing: &[String]) -> String {
-    let lead = if existing.is_empty() {
-        "Every brief compares where your time goes with what you're working towards, so it needs to know your goals well: \
-         why they matter, what done looks like, by when, and how they rank. Claude will ask, one question at a time. About ten minutes."
-    } else {
-        "Claude reads your current objectives and asks about what's missing or vague: why each matters, what done looks like, \
-         deadlines, time and ranking. Nothing changes until you save."
-    };
-    let b = format!(
-        "<div class=\"row\"><h1>Your objectives</h1><button class=\"restart small\" hidden>Start over</button></div>\
-         <p class=\"muted\">{lead}</p>\
-         <div class=\"chat\" id=\"chat\"></div><div class=\"sugg\" id=\"sugg\"></div>\
-         <form class=\"ask\" id=\"ask\"><textarea rows=\"2\" placeholder=\"Your answer… (⏎ to send, ⇧⏎ for a new line)\"></textarea><button class=\"primary\">Send</button></form>\
-         <div class=\"proposal\" id=\"proposal\" hidden><h2>Proposed objectives</h2>\
-         <p class=\"muted small\">Ranked, most important first. Edit anything, reorder with the arrows, or keep talking to change them.</p>\
-         <div id=\"objs\"></div><p class=\"row\"><button class=\"primary save\">Save these objectives</button>\
-         <span class=\"saved muted\"></span></p></div>"
-    );
-    layout("Your objectives", "Objectives", &b)
-}
-
-pub fn objectives(text: &str) -> String {
-    let b = format!(
-        "<div class=\"row\"><h1>Objectives</h1><a class=\"btn\" href=\"/onboarding\">Refine them with Claude →</a></div>\
-         <p class=\"muted\">What you're working towards. Markdown is fine. Every brief is written against this.</p>\
-         <form method=\"post\" action=\"/objectives\"><textarea name=\"text\" rows=\"18\" placeholder=\"- Ship chessLLM v1 by December&#10;- Get better at systems programming in Rust&#10;- …\">{}</textarea>\
-         <p><button type=\"submit\">Save</button></p></form>",
-        esc(text)
-    );
-    layout("Objectives", "Objectives", &b)
 }
 
 pub fn url_encode(s: &str) -> String {
@@ -624,95 +519,6 @@ if (pills.length && 'IntersectionObserver' in window) {
   go(fromHash() ?? (+store.get(key) || 0), true);
 })();
 
-// ── objectives interview ──
-(() => {
-  const chat = document.getElementById('chat');
-  if (!chat) return;
-  const form = document.getElementById('ask'), box = form.querySelector('textarea'), send = form.querySelector('button');
-  const sugg = document.getElementById('sugg'), proposal = document.getElementById('proposal'), objs = document.getElementById('objs');
-  const restart = document.querySelector('.restart');
-  const KEY = 'interview';
-  let messages = [], objectives = [];
-  try { ({messages = [], objectives = []} = JSON.parse(store.get(KEY) || '{}')); } catch (e) {}
-  const save = () => store.set(KEY, JSON.stringify({messages, objectives}));
-
-  function bubble(m) {
-    const d = el('div', 'msg ' + m.role);
-    d.innerHTML = m.text.replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'})[c]).replace(/\n/g, '<br>');
-    chat.append(d);
-    return d;
-  }
-  function render() {
-    chat.replaceChildren();
-    messages.forEach(bubble);
-    restart.hidden = !messages.length;
-    renderObjectives();
-  }
-  const FIELDS = [['why', 'Why it matters'], ['done_when', 'Done when'], ['deadline', 'Deadline'], ['time', 'Time'], ['obstacles', 'In the way'], ['notes', 'Notes']];
-  function renderObjectives() {
-    proposal.hidden = !objectives.length;
-    objs.replaceChildren(...objectives.map((o, i) => {
-      const card = el('div', 'obj'), head = el('div', 'ohead');
-      const title = el('input', 'otitle'); title.value = o.title || ''; title.oninput = () => { o.title = title.value; save(); };
-      const rank = el('span', 'rank', i + 1);
-      const up = el('button', 'small', '↑'), down = el('button', 'small', '↓'), del = el('button', 'small', '×');
-      up.disabled = i === 0; down.disabled = i === objectives.length - 1;
-      up.onclick = () => { [objectives[i - 1], objectives[i]] = [objectives[i], objectives[i - 1]]; save(); renderObjectives(); };
-      down.onclick = () => { [objectives[i + 1], objectives[i]] = [objectives[i], objectives[i + 1]]; save(); renderObjectives(); };
-      del.onclick = () => { objectives.splice(i, 1); save(); renderObjectives(); };
-      head.append(rank, title, up, down, del);
-      card.append(head);
-      FIELDS.forEach(([k, label]) => {
-        const row = el('label', 'ofield'), inp = el('input');
-        inp.value = o[k] || ''; inp.placeholder = '—';
-        inp.oninput = () => { o[k] = inp.value; save(); };
-        row.append(el('span', null, label), inp);
-        card.append(row);
-      });
-      return card;
-    }));
-  }
-  async function ask() {
-    sugg.replaceChildren();
-    const typing = bubble({role: 'assistant', text: '…'}); typing.classList.add('typing');
-    chat.lastChild.scrollIntoView({behavior: 'smooth', block: 'nearest'});
-    box.disabled = send.disabled = true;
-    try {
-      const res = await fetch('/api/interview', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({messages})});
-      if (!res.ok) throw new Error(await res.text());
-      const r = await res.json();
-      messages.push({role: 'assistant', text: r.message || '(no reply)'});
-      if (r.objectives?.length) objectives = r.objectives;
-      save(); render();
-      (r.suggestions || []).forEach(t => { const b = el('button', 'chip', t); b.onclick = () => { box.value = t; form.requestSubmit(); }; sugg.append(b); });
-      if (r.objectives?.length) proposal.scrollIntoView({behavior: 'smooth'});
-    } catch (e) {
-      typing.classList.remove('typing'); typing.classList.add('error');
-      typing.textContent = 'Claude couldn\'t answer: ' + e.message + ' — press Send to try again.';
-    } finally {
-      box.disabled = send.disabled = false; box.focus();
-    }
-  }
-  form.onsubmit = e => {
-    e.preventDefault();
-    const text = box.value.trim();
-    if (text) { messages.push({role: 'user', text}); box.value = ''; save(); render(); }
-    else if (messages.length && messages[messages.length - 1].role === 'assistant' && !chat.querySelector('.error')) return;
-    ask();
-  };
-  box.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); form.requestSubmit(); } };
-  restart.onclick = () => { if (confirm('Start the interview over? (Saved objectives stay until you save new ones.)')) { messages = []; objectives = []; save(); render(); ask(); } };
-  proposal.querySelector('.save').onclick = async e => {
-    const msg = proposal.querySelector('.saved');
-    const res = await fetch('/api/objectives', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({objectives})});
-    if (!res.ok) { msg.textContent = 'Couldn\'t save.'; return; }
-    msg.innerHTML = 'Saved. Every brief is now written against these. <a href="/objectives">See them</a> · <a href="/" class="gen">Write a brief now</a>';
-    msg.querySelector('.gen').onclick = async ev => { ev.preventDefault(); await fetch('/api/generate', {method: 'POST'}); location.href = '/'; };
-    store.set(KEY, '');
-  };
-  render();
-  if (!messages.length) ask();
-})();
 
 "#;
 
@@ -877,22 +683,4 @@ button:disabled { opacity: .4; cursor: default; }
 .fbl { color: var(--muted); font-size: 13px; margin-right: 2px; }
 .end h2 { margin-top: 0; } .endnav { display:flex; gap: 16px; flex-wrap: wrap; font: 14px ui-sans-serif, system-ui, sans-serif; margin-top: 18px; }
 
-/* objectives interview */
-.chat { display:flex; flex-direction: column; gap: 10px; margin: 20px 0 10px; font: 16px/1.5 ui-sans-serif, system-ui, sans-serif; }
-.msg { max-width: 85%; padding: 10px 14px; border-radius: 14px; animation: in-next .35s cubic-bezier(.2,.8,.2,1); }
-.msg.assistant { align-self: flex-start; background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
-.msg.user { align-self: flex-end; background: var(--accent); color: var(--bg); border-bottom-right-radius: 4px; }
-.msg.typing { color: var(--muted); animation: blink 1.2s ease-in-out infinite; } .msg.error { color: var(--red); }
-@keyframes blink { 50% { opacity: .4; } }
-.sugg { display:flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; } .sugg .chip { border: 1px solid var(--line); cursor: pointer; }
-.ask { display:flex; gap: 8px; align-items: flex-end; position: sticky; bottom: 0; background: var(--bg); padding: 10px 0; }
-.ask textarea { font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }
-.proposal { margin-top: 24px; }
-.obj { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 10px 0; animation: in-next .35s ease; }
-.ohead { display:flex; gap: 6px; align-items: center; margin-bottom: 6px; }
-.rank { flex: none; display:grid; place-items:center; width: 22px; height: 22px; border-radius: 99px; background: var(--accent); color: var(--bg); font: 600 12px ui-sans-serif, system-ui, sans-serif; }
-.otitle { flex: 1; min-width: 0; font-weight: 600; font-size: 15px; }
-.ofield { display:grid; grid-template-columns: 110px 1fr; gap: 8px; align-items: center; margin: 4px 0; font: 13px ui-sans-serif, system-ui, sans-serif; color: var(--muted); }
-.ofield input { width: 100%; padding: 4px 8px; font-size: 13px; }
-@media (max-width: 520px) { .ofield { grid-template-columns: 1fr; gap: 2px; } }
 "#;
