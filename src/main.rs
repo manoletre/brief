@@ -12,11 +12,13 @@ mod macapp;
 mod mcp;
 mod oauth;
 mod onboard;
+mod search;
 mod server;
 mod store;
 mod todoist;
 mod todos;
 mod tui;
+mod video;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -40,6 +42,24 @@ enum Cmd {
     Mcp,
     /// Write today's brief right now.
     Generate,
+    /// Rewrite briefs you already have with the current method (all of them, or the dates given,
+    /// e.g. 2026-10-19). Each old version is kept and linked from the new one.
+    Regenerate {
+        dates: Vec<String>,
+        /// Skip the explainer videos (faster).
+        #[arg(long)]
+        no_video: bool,
+        /// Keep the text; only render the videos that are missing (e.g. after installing manimgx).
+        #[arg(long)]
+        videos_only: bool,
+    },
+    /// How the brief searches the web: `brief search` shows it, `brief search use parallel <key>`
+    /// picks Parallel (or brave, browserbase, claude), `brief search setup` asks. With words, it
+    /// searches: brief search "query" … --objective "…"; brief search --read <url> …
+    Search {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Open the briefs website in your browser.
     Open,
     /// Edit your objectives in $EDITOR.
@@ -95,7 +115,11 @@ async fn main() -> Result<()> {
         }
     };
     match cmd {
-        Cmd::Init => tokio::task::spawn_blocking(move || onboard::run(store)).await?,
+        Cmd::Init => {
+            let s = store.clone();
+            tokio::task::spawn_blocking(move || onboard::run(s)).await??;
+            app(store).await
+        }
         Cmd::Serve => server::serve(store).await,
         Cmd::Mcp => mcp::run_stdio(store).await,
         Cmd::Generate => {
@@ -105,6 +129,11 @@ async fn main() -> Result<()> {
             println!("Open http://127.0.0.1:{}/brief/{}", store.config().port, b.date.unwrap());
             Ok(())
         }
+        Cmd::Regenerate { dates, no_video, videos_only } => regenerate(&store, &dates, no_video, videos_only).await,
+        Cmd::Search { args } if args.first().is_some_and(|a| a == "setup") => {
+            tokio::task::spawn_blocking(move || onboard::research_only(store)).await?
+        }
+        Cmd::Search { args } => tokio::task::spawn_blocking(move || search::cli(&store, &args)).await?,
         Cmd::Open => open_url(&format!("http://127.0.0.1:{}/", store.config().port)),
         Cmd::Objectives => edit_objectives(&store),
         Cmd::Log { project, summary } => {
@@ -218,13 +247,20 @@ async fn connected_app(store: Store, app: App, action: Option<String>) -> Result
 
 /// The terminal app. Its objectives screen hands the terminal to the interview and comes back.
 async fn app(store: Store) -> Result<()> {
+    let mut start = None;
     loop {
         let s = store.clone();
-        match tokio::task::spawn_blocking(move || tui::run(s)).await?? {
+        match tokio::task::spawn_blocking(move || tui::run(s, start)).await?? {
             tui::Exit::Quit => return Ok(()),
             tui::Exit::Interview => {
                 let s = store.clone();
                 tokio::task::spawn_blocking(move || onboard::interview_only(s)).await??;
+                start = None;
+            }
+            tui::Exit::Agent => {
+                let s = store.clone();
+                tokio::task::spawn_blocking(move || onboard::agent_only(s)).await??;
+                start = Some(tui::Sec::Agent);
             }
         }
     }
@@ -266,6 +302,46 @@ fn gui_domain() -> Result<String> {
 pub fn restart_service() -> Result<()> {
     let out = std::process::Command::new("launchctl").args(["kickstart", "-k", &format!("{}/{}", gui_domain()?, plist_label())]).output()?;
     anyhow::ensure!(out.status.success(), "couldn't restart the service: {}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(())
+}
+
+async fn regenerate(store: &Store, dates: &[String], no_video: bool, videos_only: bool) -> Result<()> {
+    let mut list: Vec<chrono::NaiveDate> = if dates.is_empty() || dates.iter().any(|d| d == "all") {
+        store.brief_dates()
+    } else {
+        dates.iter().map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").with_context(|| format!("{d} isn't a date like 2026-10-19"))).collect::<Result<_>>()?
+    };
+    // Oldest first, so each rewrite can see the ones before it.
+    list.sort_unstable();
+    anyhow::ensure!(!list.is_empty(), "there are no briefs to rewrite yet; `brief generate` writes today's");
+    if no_video {
+        std::env::set_var("BRIEF_NO_VIDEO", "1");
+    }
+    let (agent, _) = agent::configured(store);
+    let port = store.config().port;
+    if videos_only {
+        anyhow::ensure!(video::manimgx().is_some(), "manimgx isn't installed: {}", video::INSTALL);
+        for date in list {
+            let Some(mut b) = store.brief(date) else { continue };
+            eprintln!("Rendering the videos of {date}…");
+            video::render_all(store, &mut b).await;
+            store.save_brief(&b)?;
+            let n = b.sections.iter().flat_map(|s| &s.items).filter(|i| !i.video_file.is_empty()).count();
+            println!("{date}: {n} videos  http://127.0.0.1:{port}/brief/{date}");
+        }
+        return Ok(());
+    }
+    for date in list {
+        eprintln!("Rewriting the brief of {date} with {} (a few minutes, more with videos)…", agent.name());
+        match generate::regenerate(store, date).await {
+            Ok(b) => {
+                let videos = b.sections.iter().flat_map(|s| &s.items).filter(|i| !i.video_file.is_empty()).count();
+                println!("{date} v{}: {}  ({videos} videos)", b.version, b.headline);
+                println!("  http://127.0.0.1:{port}/brief/{date}");
+            }
+            Err(e) => eprintln!("{date}: failed: {e:#}"),
+        }
+    }
     Ok(())
 }
 

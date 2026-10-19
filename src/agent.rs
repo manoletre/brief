@@ -33,7 +33,9 @@ pub enum Tools {
     /// Just answer (the interview).
     None,
     /// Search and read the web, and run the `composio` CLI when `composio` is set (the brief).
-    Research { composio: bool },
+    /// With `search`, searching goes through `brief search` (Parallel, Brave or Browserbase)
+    /// instead of the agent's own web search.
+    Research { composio: bool, search: bool },
 }
 
 pub struct Reply {
@@ -119,6 +121,11 @@ impl Agent {
         }
     }
 
+    /// Can it run `brief search` during a brief? Codex's read-only sandbox has no network for commands.
+    pub fn runs_commands(self) -> bool {
+        self != Agent::Codex
+    }
+
     pub fn model_label(self, id: &str) -> String {
         match self.models().iter().find(|m| m.id == id) {
             Some(m) => m.label.to_owned(),
@@ -172,6 +179,8 @@ impl Agent {
         let work = store.root.join("work");
         let mut cmd = Command::new(&bin);
         cmd.current_dir(&work).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        // `brief search` must find this build and this store.
+        cmd.env("BRIEF_HOME", &store.root).env("PATH", tool_path());
         let mut stdin_prompt = true;
         let mut last_message: Option<PathBuf> = None;
         match self {
@@ -184,10 +193,21 @@ impl Agent {
                     Tools::None => {
                         cmd.args(["--tools", ""]);
                     }
-                    Tools::Research { composio } => {
-                        let allowed = if composio { "WebSearch,WebFetch,Bash(composio:*)" } else { "WebSearch,WebFetch" };
-                        cmd.args(["--allowedTools", allowed]);
-                        cmd.args(["--disallowedTools", if composio { "Edit,Write,NotebookEdit" } else { "Bash,Edit,Write,NotebookEdit" }]);
+                    Tools::Research { composio, search } => {
+                        let mut allowed = vec!["WebFetch"];
+                        allowed.push(if search { "Bash(brief search:*)" } else { "WebSearch" });
+                        if composio {
+                            allowed.push("Bash(composio:*)");
+                        }
+                        let mut denied = vec!["Edit", "Write", "NotebookEdit"];
+                        if search {
+                            denied.push("WebSearch");
+                        }
+                        if !search && !composio {
+                            denied.push("Bash");
+                        }
+                        cmd.args(["--allowedTools", &allowed.join(",")]);
+                        cmd.args(["--disallowedTools", &denied.join(",")]);
                     }
                 }
             }
@@ -289,6 +309,17 @@ pub fn configured(store: &Store) -> (Agent, String) {
     (Agent::from_id(&cfg.agent), cfg.model)
 }
 
+/// PATH for the agent: brief's own folder first, then the usual install spots (launchd's PATH is bare).
+pub fn tool_path() -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = crate::connect::stable_exe().parent().map(|d| vec![d.to_path_buf()]).unwrap_or_default();
+    if let Some(home) = dirs::home_dir() {
+        dirs.extend([home.join(".local/bin"), home.join(".npm-global/bin")]);
+    }
+    dirs.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
+    dirs.extend(["/opt/homebrew/bin".into(), "/usr/local/bin".into(), "/usr/bin".into(), "/bin".into()]);
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
 pub fn find_bin(name: &str) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
@@ -315,10 +346,47 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Take the JSON object out of an agent's reply (they sometimes wrap it in prose or fences).
+/// Take the JSON object out of an agent's reply. They sometimes wrap it in prose or fences, or
+/// write one, notice a mistake and write a corrected one after it: the last complete object wins.
 pub fn json_object(text: &str) -> &str {
-    match (text.find('{'), text.rfind('}')) {
-        (Some(a), Some(b)) if b > a => &text[a..=b],
-        _ => "",
+    let mut found = "";
+    let mut i = 0;
+    while let Some(off) = text[i..].find('{') {
+        let start = i + off;
+        let mut objects = serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde::de::IgnoredAny>();
+        match objects.next() {
+            Some(Ok(_)) => {
+                let end = start + objects.byte_offset();
+                found = &text[start..end];
+                i = end;
+            }
+            _ => i = start + 1,
+        }
+    }
+    if found.is_empty() {
+        // Nothing parses on its own: hand back the outermost braces for the caller's fallback.
+        if let (Some(a), Some(b)) = (text.find('{'), text.rfind('}')) {
+            if b > a {
+                return &text[a..=b];
+            }
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_object;
+
+    #[test]
+    fn last_complete_object_wins() {
+        let text = r#"{"message": "a and b?", "suggestions": []}
+
+Wait, that's two questions. Corrected:
+
+{"message": "b?", "suggestions": ["{x}"]}"#;
+        assert_eq!(json_object(text), r#"{"message": "b?", "suggestions": ["{x}"]}"#);
+        assert_eq!(json_object("Here you go: ```json\n{\"a\": {\"b\": 1}}\n```"), r#"{"a": {"b": 1}}"#);
+        assert_eq!(json_object("no json"), "");
     }
 }

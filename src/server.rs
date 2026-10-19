@@ -57,6 +57,8 @@ pub async fn serve(store: Store) -> Result<()> {
         .route("/api/browsing", post(add_browsing))
         .route("/api/feedback", post(add_feedback))
         .route("/api/generate", post(start_generate))
+        .route("/api/regenerate/:date", post(start_regenerate))
+        .route("/media/:date/:version/:file", get(media))
         .route("/api/status", get(status))
         .route("/icon.svg", get(|| async { ([("content-type", "image/svg+xml")], mcp::ICON_SVG) }))
         .route("/icon.png", get(|| async { ([("content-type", "image/png")], mcp::ICON_PNG) }))
@@ -184,14 +186,24 @@ fn anki_upkeep(app: &Arc<App>, minute: u64) {
 }
 
 fn spawn_generate(app: &Arc<App>) {
+    spawn_write(app, None);
+}
+
+/// Write today's brief, or rewrite the one of `date`, in the background.
+fn spawn_write(app: &Arc<App>, date: Option<NaiveDate>) {
     if app.generating.swap(true, Ordering::SeqCst) {
         return;
     }
-    *app.last_attempt.lock().unwrap() = Some(Local::now());
+    if date.is_none() {
+        *app.last_attempt.lock().unwrap() = Some(Local::now());
+    }
     let app = app.clone();
     tokio::spawn(async move {
-        eprintln!("brief: generating daily brief…");
-        let result = generate::generate(&app.store).await;
+        eprintln!("brief: {}…", date.map_or("generating daily brief".to_owned(), |d| format!("rewriting the brief of {d}")));
+        let result = match date {
+            Some(d) => generate::regenerate(&app.store, d).await,
+            None => generate::generate(&app.store).await,
+        };
         match &result {
             Ok(b) => eprintln!("brief: done — {}", b.headline),
             Err(e) => eprintln!("brief: generation failed: {e:#}"),
@@ -214,7 +226,12 @@ async fn today(State(app): S) -> Redirect {
     }
 }
 
-async fn brief(State(app): S, Path(date): Path<String>) -> Response {
+#[derive(Deserialize)]
+struct BriefQuery {
+    v: Option<u32>,
+}
+
+async fn brief(State(app): S, Path(date): Path<String>, axum::extract::Query(q): axum::extract::Query<BriefQuery>) -> Response {
     let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -223,9 +240,60 @@ async fn brief(State(app): S, Path(date): Path<String>) -> Response {
     let i = dates.iter().position(|d| *d == date);
     let newer = i.and_then(|i| i.checked_sub(1)).map(|i| dates[i]);
     let older = i.and_then(|i| dates.get(i + 1).copied());
-    match app.store.brief(date) {
-        Some(b) => Html(html::brief(&b, &app.store.feedback(), older, newer)).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+    let current = app.store.brief(date);
+    let shown = match q.v {
+        Some(n) if current.as_ref().is_some_and(|b| b.version.max(1) != n) => app.store.brief_version(date, n),
+        _ => current.clone(),
+    };
+    let Some(b) = shown else { return StatusCode::NOT_FOUND.into_response() };
+    let mut versions = app.store.brief_versions(date);
+    if let Some(c) = &current {
+        versions.retain(|n| *n != c.version.max(1));
+        versions.push(c.version.max(1));
+    }
+    let nav = html::Versions { all: versions, current: current.map_or(1, |c| c.version.max(1)), rewriting: app.generating.load(Ordering::SeqCst) };
+    Html(html::brief(&b, &app.store.feedback(), older, newer, &nav)).into_response()
+}
+
+async fn start_regenerate(State(app): S, Path(date): Path<String>) -> StatusCode {
+    let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") else { return StatusCode::NOT_FOUND };
+    if app.store.brief(date).is_none() {
+        return StatusCode::NOT_FOUND;
+    }
+    spawn_write(&app, Some(date));
+    StatusCode::ACCEPTED
+}
+
+/// A brief's video: /media/DATE/vN/ITEM.mp4, with byte ranges so the player can seek.
+async fn media(State(app): S, Path((date, version, file)): Path<(String, String, String)>, headers: HeaderMap) -> Response {
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') && !s.starts_with('.');
+    let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") else { return StatusCode::NOT_FOUND.into_response() };
+    if !ok(&version) || !ok(&file) || !file.ends_with(".mp4") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = app.store.media_dir(date).join(&version).join(&file);
+    let Ok(Ok(data)) = tokio::task::spawn_blocking(move || std::fs::read(path)).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let len = data.len();
+    let range = headers.get("range").and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes=")).and_then(|r| {
+        let (a, b) = r.split_once('-')?;
+        let start: usize = a.parse().ok()?;
+        let end: usize = if b.is_empty() { len.checked_sub(1)? } else { b.parse::<usize>().ok()?.min(len.checked_sub(1)?) };
+        (start <= end).then_some((start, end))
+    });
+    let mut h = HeaderMap::new();
+    h.insert("content-type", HeaderValue::from_static("video/mp4"));
+    h.insert("accept-ranges", HeaderValue::from_static("bytes"));
+    h.insert("cache-control", HeaderValue::from_static("max-age=3600"));
+    match range {
+        Some((a, b)) => {
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes {a}-{b}/{len}")) {
+                h.insert("content-range", v);
+            }
+            (StatusCode::PARTIAL_CONTENT, h, data[a..=b].to_vec()).into_response()
+        }
+        None => (h, data).into_response(),
     }
 }
 

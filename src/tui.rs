@@ -1,6 +1,6 @@
 //! `brief` with no arguments: a full-screen terminal app.
 
-use crate::{browsing, calendar, connect, editor::Editor, generate, store::{Entry, Store}, granola, todoist};
+use crate::{anki, browsing, calendar, connect, editor::Editor, generate, search, store::{Entry, Store}, granola, todoist, video};
 use anyhow::Result;
 use chrono::{Local, NaiveDate};
 use ratatui::{
@@ -16,16 +16,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 // 256-colour palette so it looks the same in Terminal.app, iTerm and others.
-const ACCENT: Color = Color::Indexed(208);
-const DIM: Color = Color::Indexed(244);
-const FAINT: Color = Color::Indexed(240);
-const LINE: Color = Color::Indexed(238);
-const GOOD: Color = Color::Indexed(114);
-const BAD: Color = Color::Indexed(203);
-const BANNER_COLORS: [u8; 6] = [202, 202, 208, 208, 214, 214];
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub(crate) const ACCENT: Color = Color::Indexed(208);
+pub(crate) const DIM: Color = Color::Indexed(244);
+pub(crate) const FAINT: Color = Color::Indexed(240);
+pub(crate) const LINE: Color = Color::Indexed(238);
+pub(crate) const GOOD: Color = Color::Indexed(114);
+pub(crate) const BAD: Color = Color::Indexed(203);
+pub(crate) const BANNER_COLORS: [u8; 6] = [202, 202, 208, 208, 214, 214];
+pub(crate) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-const BANNER: [&str; 6] = [
+pub(crate) const BANNER: [&str; 6] = [
     "██████╗ ██████╗ ██╗███████╗███████╗",
     "██╔══██╗██╔══██╗██║██╔════╝██╔════╝",
     "██████╔╝██████╔╝██║█████╗  █████╗  ",
@@ -39,8 +39,10 @@ enum Screen {
     Home,
     Objectives,
     Journal,
-    Settings,
-    Connect,
+    /// Every part of brief you can set up, one panel per section.
+    Setup,
+    /// One section opened: its rows, and what the selected one does.
+    Panel(Sec),
 }
 
 #[derive(Clone, Copy)]
@@ -49,37 +51,93 @@ enum Action {
     Generate,
     Objectives,
     Journal,
-    Connect,
-    Settings,
+    Setup,
     Service,
     Quit,
 }
 
+/// The sections of Setup.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Sec {
+    Agent,
+    Chatbots,
+    Reads,
+    Research,
+}
+const SECS: [Sec; 4] = [Sec::Agent, Sec::Chatbots, Sec::Reads, Sec::Research];
+
+impl Sec {
+    fn title(self) -> &'static str {
+        match self {
+            Sec::Agent => "Your agent",
+            Sec::Chatbots => "Chatbots that log your work",
+            Sec::Reads => "What the brief reads",
+            Sec::Research => "Research & videos",
+        }
+    }
+
+    fn blurb(self) -> &'static str {
+        match self {
+            Sec::Agent => "The agent that writes your brief, when it writes it, and the background service that runs it.",
+            Sec::Chatbots => "Give these brief's tools, so they log your decisions, progress and blockers on their own.",
+            Sec::Reads => "The more the brief sees of your day, the more honest it gets. Everything stays on this Mac; brief only reads.",
+            Sec::Research => "What the brief searches the web with to find hidden gems for your open problems, and its explainer videos.",
+        }
+    }
+
+    fn rows(self) -> Vec<Conn> {
+        match self {
+            Sec::Agent => vec![Conn::Agent, Conn::Model, Conn::Hour, Conn::Service],
+            Sec::Chatbots => vec![Conn::ClaudeCode, Conn::ClaudeDesktop, Conn::Codex, Conn::Cline, Conn::OpenCode, Conn::Tunnel, Conn::ChatGpt, Conn::ClaudeAi, Conn::Grok],
+            Sec::Reads => vec![Conn::Calendar, Conn::Todoist, Conn::Granola, Conn::Browser, Conn::Anki, Conn::Composio],
+            Sec::Research => search::ALL.iter().map(|p| Conn::Search(*p)).chain([Conn::Videos]).collect(),
+        }
+    }
+}
+
+/// One row of a Setup panel.
 #[derive(Clone, Copy, PartialEq)]
 enum Conn {
+    Agent,
+    Model,
+    Hour,
+    Service,
     ClaudeCode,
     ClaudeDesktop,
+    Codex,
+    Cline,
+    OpenCode,
     Tunnel,
     ChatGpt,
     ClaudeAi,
     Grok,
+    Calendar,
     Todoist,
     Granola,
-    Calendar,
     Browser,
+    Anki,
+    Composio,
+    Search(search::Provider),
+    Videos,
 }
-const CONNS: [Conn; 10] = [
-    Conn::ClaudeCode,
-    Conn::ClaudeDesktop,
-    Conn::Tunnel,
-    Conn::ChatGpt,
-    Conn::ClaudeAi,
-    Conn::Grok,
-    Conn::Todoist,
-    Conn::Granola,
-    Conn::Calendar,
-    Conn::Browser,
-];
+
+const COMPOSIO_INSTALL: &str = "curl -fsSL https://composio.dev/install | sh";
+/// Where installers put commands, which a fresh shell may not have on PATH yet.
+const LOCAL_BIN: &str = "export PATH=\"$HOME/.local/bin:$HOME/.composio:$PATH\";";
+
+/// Commands that need the real terminal (installs and sign-ins), and what to do after them.
+struct Outside {
+    title: String,
+    cmds: Vec<Vec<String>>,
+    after: After,
+}
+
+#[derive(Clone, Copy)]
+enum After {
+    Composio,
+    Parallel,
+    Videos,
+}
 
 #[derive(Default)]
 struct Status {
@@ -107,6 +165,15 @@ struct Status {
     /// The browser extension's files are written; `chrome_seen` once it has sent something lately.
     chrome_installed: bool,
     chrome_seen: bool,
+    /// (installed, connected) for the agent CLIs that can log to brief.
+    codex: (bool, bool),
+    cline: (bool, bool),
+    opencode: (bool, bool),
+    /// Only checked on the Setup screens (it asks AnkiConnect).
+    anki: bool,
+    composio: bool,
+    search: Option<search::Provider>,
+    manimgx: bool,
 }
 
 type Job = mpsc::Receiver<Result<String, String>>;
@@ -115,6 +182,8 @@ type Job = mpsc::Receiver<Result<String, String>>;
 pub enum Exit {
     Quit,
     Interview,
+    /// Pick the agent and model with onboarding's screens, then come back to Setup.
+    Agent,
 }
 
 struct App {
@@ -134,15 +203,20 @@ struct App {
     editing: bool,
     wrap_w: usize,
     deleted: Option<(usize, String)>,
-    // Journal / settings / connect
+    // Journal / setup
     scroll: u16,
-    settings_row: usize,
-    csel: usize,
+    /// The selected panel on Setup, and the selected row in an open panel.
+    psel: usize,
+    rsel: usize,
+    /// Typing an API key for a search provider.
+    key_input: Option<(search::Provider, Editor)>,
+    outside: Option<Outside>,
     job: Option<(Conn, Job)>,
     exit: Exit,
 }
 
-pub fn run(store: Store) -> Result<Exit> {
+/// `start`: open Setup on that section (coming back from a step that needed the whole terminal).
+pub fn run(store: Store, start: Option<Sec>) -> Result<Exit> {
     let mut app = App {
         store,
         rt: tokio::runtime::Handle::current(),
@@ -160,16 +234,24 @@ pub fn run(store: Store) -> Result<Exit> {
         wrap_w: 60,
         deleted: None,
         scroll: 0,
-        settings_row: 0,
-        csel: 0,
+        psel: 0,
+        rsel: 0,
+        key_input: None,
+        outside: None,
         job: None,
         exit: Exit::Quit,
     };
+    if let Some(sec) = start {
+        app.psel = SECS.iter().position(|s| *s == sec).unwrap_or(0);
+        app.screen = Screen::Panel(sec);
+    }
     app.refresh();
-    if app.status.goals == 0 {
+    if app.status.goals == 0 && start.is_none() {
         app.open_objectives();
     }
     let mut terminal = ratatui::init();
+    // Coming back from onboarding or the interview: start from a blank screen.
+    let _ = terminal.clear();
     // Alternate scroll mode: the mouse wheel arrives as ↑/↓ keys, without capturing
     // the mouse, so text selection keeps working.
     let _ = std::io::stdout().write_all(b"\x1b[?1007h").and_then(|_| std::io::stdout().flush());
@@ -189,6 +271,9 @@ impl App {
                     if k.kind == KeyEventKind::Press && !self.on_key(k) {
                         return Ok(());
                     }
+                }
+                if let Some(o) = self.outside.take() {
+                    self.run_outside(terminal, o);
                 }
             }
         }
@@ -252,6 +337,13 @@ impl App {
             calendar: calendar::connected(&self.store),
             chrome_installed: browsing::installed(&self.store),
             chrome_seen: browsing::last_seen(&self.store).is_some_and(|t| chrono::Local::now() - t < chrono::Duration::days(3)),
+            codex: (crate::agent::Agent::Codex.find().is_some(), connect::codex_connected()),
+            cline: (crate::agent::Agent::Cline.find().is_some(), connect::cline_connected()),
+            opencode: (crate::agent::Agent::OpenCode.find().is_some(), connect::opencode_connected()),
+            anki: if matches!(self.screen, Screen::Setup | Screen::Panel(_)) { anki::available(false) } else { self.status.anki },
+            composio: cfg.composio,
+            search: Some(search::active(&self.store)),
+            manimgx: video::manimgx().is_some(),
         };
         self.refreshed = Some(Instant::now());
     }
@@ -289,13 +381,10 @@ impl App {
                 n => format!("{n} objectives"),
             }),
             (Action::Journal, "Journal".into(), format!("{} entries from your chatbots", s.entries)),
-            (Action::Connect, "Connect chatbots & apps".into(), match connected {
-                0 => "nothing connected yet".into(),
-                n => format!("{n} connected"),
-            }),
-            (Action::Settings, "Settings".into(), {
+            (Action::Setup, "Setup".into(), {
                 let agent = crate::agent::Agent::from_id(&cfg.agent);
-                format!("brief at {:02}:00 · {} · {}", cfg.brief_hour, agent.name(), agent.model_label(&cfg.model))
+                let search = s.search.map_or("", |p| if p == search::Provider::Claude { "agent's search" } else { p.name() });
+                format!("{} · {} at {:02}:00 · {connected} connected · {search}", agent.name(), agent.model_label(&cfg.model), cfg.brief_hour)
             }),
             (Action::Service, if s.service_installed { "Stop running in background".into() } else { "Run in background".into() },
                 if s.service_installed { "removes the login item".into() } else { "starts at login, writes the brief daily".into() }),
@@ -317,7 +406,8 @@ impl App {
             Screen::Home => return self.home_key(k),
             Screen::Objectives if self.editing => self.edit_key(k),
             Screen::Objectives => return self.objectives_key(k),
-            Screen::Connect => self.connect_key(k),
+            Screen::Setup => self.setup_key(k),
+            Screen::Panel(sec) => return self.panel_key(sec, k),
             Screen::Journal => match k.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => self.screen = Screen::Home,
                 KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
@@ -329,7 +419,6 @@ impl App {
                 KeyCode::End | KeyCode::Char('G') => self.scroll = u16::MAX,
                 _ => {}
             },
-            Screen::Settings => self.settings_key(k),
         }
         true
     }
@@ -390,10 +479,9 @@ impl App {
                 self.scroll = 0;
                 self.screen = Screen::Journal;
             }
-            Action::Connect => self.screen = Screen::Connect,
-            Action::Settings => {
-                self.settings_row = 0;
-                self.screen = Screen::Settings;
+            Action::Setup => {
+                self.screen = Screen::Setup;
+                self.refreshed = None;
             }
             Action::Service => {
                 let result = if self.status.service_installed { crate::uninstall() } else { crate::install(&self.store) };
@@ -588,35 +676,141 @@ impl App {
         }
     }
 
-    // ── connect ──────────────────────────────────────────────
+    // ── setup ────────────────────────────────────────────────
 
-    fn connect_key(&mut self, k: KeyEvent) {
-        let conn = CONNS[self.csel];
+    fn setup_key(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => self.screen = Screen::Home,
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => self.csel = (self.csel + 1) % CONNS.len(),
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => self.csel = (self.csel + CONNS.len() - 1) % CONNS.len(),
-            KeyCode::Char('c') => {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.screen = Screen::Home,
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => self.psel = (self.psel + 1) % SECS.len(),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => self.psel = (self.psel + SECS.len() - 1) % SECS.len(),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Up | KeyCode::Char('k') => self.psel = (self.psel + 2) % SECS.len(),
+            KeyCode::Char(c @ '1'..='4') => self.open_panel(c as usize - '1' as usize),
+            KeyCode::Enter | KeyCode::Char(' ') => self.open_panel(self.psel),
+            _ => {}
+        }
+    }
+
+    fn open_panel(&mut self, i: usize) {
+        self.psel = i;
+        self.rsel = 0;
+        self.key_input = None;
+        self.screen = Screen::Panel(SECS[i]);
+    }
+
+    /// Returns false to leave the app (to run a step that needs the whole terminal).
+    fn panel_key(&mut self, sec: Sec, k: KeyEvent) -> bool {
+        if self.key_input.is_some() {
+            self.key_input_key(k);
+            return true;
+        }
+        let rows = sec.rows();
+        self.rsel = self.rsel.min(rows.len() - 1);
+        let conn = rows[self.rsel];
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.screen = Screen::Setup,
+            KeyCode::Down | KeyCode::Char('j') => self.rsel = (self.rsel + 1) % rows.len(),
+            KeyCode::Up | KeyCode::Char('k') if !matches!(conn, Conn::Search(_)) || k.code == KeyCode::Up => self.rsel = (self.rsel + rows.len() - 1) % rows.len(),
+            KeyCode::Tab => self.open_panel((self.psel + 1) % SECS.len()),
+            KeyCode::BackTab => self.open_panel((self.psel + SECS.len() - 1) % SECS.len()),
+            KeyCode::Left | KeyCode::Char('h') if matches!(conn, Conn::Model | Conn::Hour) => self.change(conn, -1),
+            KeyCode::Right | KeyCode::Char('l') if matches!(conn, Conn::Model | Conn::Hour) => self.change(conn, 1),
+            KeyCode::Char('c') if sec == Sec::Chatbots => {
                 let url = self.status.tunnel_url.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}/mcp", self.store.config().port));
                 match connect::copy(&url) {
                     Ok(()) => self.say(format!("Copied {}", redact(&url)), false),
                     Err(e) => self.say(format!("Couldn't copy: {e}"), true),
                 }
             }
+            KeyCode::Char('k') => {
+                if let Conn::Search(p) = conn {
+                    if p.key_url().is_some() {
+                        self.key_input = Some((p, Editor::new("")));
+                    }
+                }
+            }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => {
                 if self.job.is_some() {
                     self.say("One moment, still working on the last step…", false);
                 } else {
-                    self.connect_action(conn);
+                    return self.connect_action(conn);
                 }
             }
             _ => {}
         }
+        true
     }
 
-    fn connect_action(&mut self, conn: Conn) {
+    fn key_input_key(&mut self, k: KeyEvent) {
+        let Some((p, ed)) = self.key_input.as_mut() else { return };
+        let p = *p;
+        match k.code {
+            KeyCode::Esc => self.key_input = None,
+            KeyCode::Char('o') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(url) = p.key_url() {
+                    connect::open(url);
+                }
+            }
+            KeyCode::Enter if !ed.is_blank() => {
+                let key = ed.text().trim().to_owned();
+                self.key_input = None;
+                if let Err(e) = search::choose(&self.store, p, Some(&key)) {
+                    return self.say(format!("Couldn't save: {e}"), true);
+                }
+                self.test_search(p);
+            }
+            _ => crate::onboard::edit(ed, k),
+        }
+    }
+
+    /// ←→ on a row with a value.
+    fn change(&mut self, conn: Conn, delta: i32) {
+        let mut cfg = self.store.config();
+        match conn {
+            Conn::Hour => cfg.brief_hour = (cfg.brief_hour as i32 + delta).rem_euclid(24) as u32,
+            Conn::Model => {
+                let models = crate::agent::Agent::from_id(&cfg.agent).models();
+                let i = models.iter().position(|m| m.id == cfg.model).unwrap_or(0) as i32;
+                cfg.model = models[(i + delta).rem_euclid(models.len() as i32) as usize].id.into();
+            }
+            _ => return,
+        }
+        match self.store.save_config(&cfg) {
+            Ok(()) => self.say("Saved", false),
+            Err(e) => self.say(format!("Couldn't save: {e}"), true),
+        }
+    }
+
+    /// Use `p` for the brief's research, after a test search (back to the agent's own if it fails).
+    fn test_search(&mut self, p: search::Provider) {
+        let store = self.store.clone();
+        self.start_job(Conn::Search(p), move || {
+            search::choose(&store, p, None)?;
+            search::test(&store).inspect_err(|_| {
+                let mut st = search::settings(&store);
+                st.provider = search::Provider::Claude.id().into();
+                let _ = search::save(&store, &st);
+            })
+        });
+    }
+
+    /// ⏎ on a row. Returns false to leave the app for a step that needs the whole terminal.
+    fn connect_action(&mut self, conn: Conn) -> bool {
         let s = &self.status;
         match conn {
+            Conn::Agent => {
+                self.exit = Exit::Agent;
+                return false;
+            }
+            Conn::Model | Conn::Hour => self.change(conn, 1),
+            Conn::Service => {
+                let result = if s.service_installed { crate::uninstall() } else { crate::install(&self.store) };
+                match result {
+                    Ok(msg) => self.say(msg, false),
+                    Err(e) => self.say(format!("{e:#}"), true),
+                }
+                std::thread::sleep(Duration::from_millis(400));
+                self.refresh();
+            }
             Conn::ClaudeCode if !s.code_installed => self.say("Claude Code isn't installed on this Mac.", true),
             Conn::ClaudeCode => {
                 let on = !s.code_connected;
@@ -625,6 +819,22 @@ impl App {
             Conn::ClaudeDesktop => {
                 let store = self.store.clone();
                 self.start_job(conn, move || connect::install_claude_desktop(&store));
+            }
+            Conn::Codex | Conn::Cline | Conn::OpenCode => {
+                let (installed, on) = match conn {
+                    Conn::Codex => s.codex,
+                    Conn::Cline => s.cline,
+                    _ => s.opencode,
+                };
+                if !installed {
+                    self.say("It isn't installed on this Mac.", true);
+                } else {
+                    self.start_job(conn, move || match conn {
+                        Conn::Codex => connect::set_codex(!on),
+                        Conn::Cline => connect::set_cline(!on),
+                        _ => connect::set_opencode(!on),
+                    });
+                }
             }
             Conn::Tunnel if !s.tailscale => self.start_job(conn, connect::get_tailscale),
             Conn::Tunnel => {
@@ -685,36 +895,117 @@ impl App {
                 }
                 self.start_job(conn, move || browsing::install(&store).map(|t| t.lines().next().unwrap_or_default().to_owned()));
             }
+            Conn::Anki if s.anki => self.say("Anki is connected through AnkiConnect.", false),
+            Conn::Anki => self.start_job(conn, || {
+                if anki::available(true) {
+                    Ok("Anki is connected.".into())
+                } else {
+                    anyhow::bail!("Anki needs the AnkiConnect add-on: in Anki, Tools → Add-ons → Get Add-ons…, paste 2055492159, restart Anki")
+                }
+            }),
+            Conn::Composio if s.composio => {
+                let mut cfg = self.store.config();
+                cfg.composio = false;
+                match self.store.save_config(&cfg) {
+                    Ok(()) => self.say("The brief no longer reads your Composio apps. ⏎ again to set it up.", false),
+                    Err(e) => self.say(format!("Couldn't save: {e}"), true),
+                }
+                self.refreshed = None;
+            }
+            Conn::Composio => {
+                let mut cmds = Vec::new();
+                if crate::agent::find_bin("composio").is_none() {
+                    cmds.push(crate::onboard::sh(COMPOSIO_INSTALL));
+                }
+                cmds.push(crate::onboard::sh(&format!("{LOCAL_BIN} composio login")));
+                self.outside = Some(Outside { title: "Signing in to Composio (a browser page opens)".into(), cmds, after: After::Composio });
+            }
+            Conn::Search(p) if search::ready(&self.store, p) => {
+                if p == search::Provider::Claude {
+                    match search::choose(&self.store, p, None) {
+                        Ok(()) => self.say("The brief will use your agent's own web search.", false),
+                        Err(e) => self.say(format!("Couldn't save: {e}"), true),
+                    }
+                    self.refreshed = None;
+                } else {
+                    self.test_search(p);
+                }
+            }
+            Conn::Search(search::Provider::Parallel) => {
+                // One ⏎: install Parallel's CLI if needed and sign in through the browser.
+                let mut cmds = Vec::new();
+                if search::parallel_cli().is_none() {
+                    cmds.push(crate::onboard::sh(search::PARALLEL_CLI_INSTALL));
+                }
+                cmds.push(crate::onboard::sh(&format!("{LOCAL_BIN} parallel-cli login")));
+                self.outside = Some(Outside { title: "Signing in to Parallel (a browser page opens: approve brief there)".into(), cmds, after: After::Parallel });
+            }
+            Conn::Search(p) => self.key_input = Some((p, Editor::new(""))),
+            Conn::Videos if s.manimgx => self.say("ManimGX is installed: your briefs have explainer videos.", false),
+            Conn::Videos => {
+                self.outside = Some(Outside { title: "Installing ManimGX".into(), cmds: vec![crate::onboard::sh(&format!("{LOCAL_BIN} {}", video::INSTALL))], after: After::Videos });
+            }
         }
+        true
     }
 
-    fn settings_key(&mut self, k: KeyEvent) {
-        let mut cfg = self.store.config();
-        let delta: i32 = match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
-                self.screen = Screen::Home;
-                return;
+    /// Hand the terminal to installers and sign-ins, then come back.
+    fn run_outside(&mut self, terminal: &mut DefaultTerminal, o: Outside) {
+        let _ = std::io::stdout().write_all(b"\x1b[?1007l").and_then(|_| std::io::stdout().flush());
+        ratatui::restore();
+        let (accent, dim, bad, reset) = ("\x1b[38;5;208m", "\x1b[38;5;244m", "\x1b[38;5;203m", "\x1b[0m");
+        println!("\n  {accent}brief{reset} › {}\n", o.title);
+        let mut ok = true;
+        for cmd in &o.cmds {
+            println!("  {dim}$ {}{reset}\n", cmd.last().map(|c| c.trim_start_matches(LOCAL_BIN).trim()).unwrap_or_default());
+            if !std::process::Command::new(&cmd[0]).args(&cmd[1..]).status().is_ok_and(|s| s.success()) {
+                ok = false;
+                println!("\n  {bad}That didn't finish.{reset}");
+                break;
             }
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab | KeyCode::Up | KeyCode::Char('k') => {
-                self.settings_row = (self.settings_row + 1) % 2;
-                return;
-            }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => 1,
-            KeyCode::Left | KeyCode::Char('h') => -1,
-            _ => return,
+        }
+        let line = |prompt: &str| -> String {
+            print!("{prompt}");
+            let _ = std::io::stdout().flush();
+            let mut l = String::new();
+            let _ = std::io::stdin().read_line(&mut l);
+            l.trim().to_owned()
         };
-        match self.settings_row {
-            0 => cfg.brief_hour = (cfg.brief_hour as i32 + delta).rem_euclid(24) as u32,
-            _ => {
-                let models = crate::agent::Agent::from_id(&cfg.agent).models();
-                let i = models.iter().position(|m| m.id == cfg.model).unwrap_or(0) as i32;
-                cfg.model = models[(i + delta).rem_euclid(models.len() as i32) as usize].id.into();
+        match o.after {
+            After::Composio if ok => {
+                println!("\n  Which apps should brief read? Their names, separated by spaces (gmail slack notion github linear).");
+                let apps = line(&format!("  {accent}›{reset} "));
+                for app in apps.split([' ', ',']).map(str::trim).filter(|a| !a.is_empty()) {
+                    let app: String = app.to_lowercase().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+                    println!("\n  {dim}$ composio link {app}{reset}\n");
+                    let _ = std::process::Command::new("/bin/sh").args(["-c", &format!("{LOCAL_BIN} composio link {app}")]).status();
+                }
+                let mut cfg = self.store.config();
+                cfg.composio = true;
+                match self.store.save_config(&cfg) {
+                    Ok(()) => self.say("Composio is connected. The brief reads those apps each morning (read-only).", false),
+                    Err(e) => self.say(format!("Couldn't save: {e}"), true),
+                }
             }
+            After::Composio => self.say("Composio isn't signed in yet. ⏎ to try again.", true),
+            After::Parallel => {
+                search::recheck_parallel();
+                if search::parallel_signed_in() {
+                    self.test_search(search::Provider::Parallel);
+                } else {
+                    self.say("Parallel isn't signed in yet. ⏎ to try again, or k to paste an API key.", true);
+                }
+            }
+            After::Videos if video::manimgx().is_some() => self.say("ManimGX is installed: your briefs have explainer videos.", false),
+            After::Videos => self.say("ManimGX still isn't there; the brief works without videos.", true),
         }
-        match self.store.save_config(&cfg) {
-            Ok(()) => self.say("Saved", false),
-            Err(e) => self.say(format!("Couldn't save: {e}"), true),
+        if !matches!(o.after, After::Composio) || !ok {
+            line(&format!("\n  {dim}Press ⏎ to go back to brief{reset} "));
         }
+        *terminal = ratatui::init();
+        let _ = terminal.clear();
+        let _ = std::io::stdout().write_all(b"\x1b[?1007h").and_then(|_| std::io::stdout().flush());
+        self.refreshed = None;
     }
 
     // ── drawing ──────────────────────────────────────────────
@@ -730,8 +1021,8 @@ impl App {
             Screen::Home => self.draw_home(f, body),
             Screen::Objectives => self.draw_objectives(f, body),
             Screen::Journal => self.draw_journal(f, body),
-            Screen::Settings => self.draw_settings(f, body),
-            Screen::Connect => self.draw_connect(f, body),
+            Screen::Setup => self.draw_setup(f, body),
+            Screen::Panel(sec) => self.draw_panel(f, body, sec),
         }
 
         if let Some((msg, err, at)) = &self.toast {
@@ -745,8 +1036,12 @@ impl App {
             Screen::Home => &[("↑↓", "move"), ("⏎", "select"), ("1-8", "jump"), ("q", "quit")],
             Screen::Objectives if self.editing => &[("esc", "done"), ("⏎", "next objective"), ("⌥⏎", "line break"), ("↑↓", "move"), ("⌥⌫", "del word")],
             Screen::Objectives => &[("↑↓", "move"), ("⏎", "edit"), ("n", "new"), ("d", "delete"), ("⇧↑↓", "reorder"), ("i", "interview"), ("esc", "back")],
-            Screen::Settings => &[("↑↓", "choose"), ("←→", "change"), ("esc", "back")],
-            Screen::Connect => &[("↑↓", "move"), ("⏎", "connect / disconnect"), ("c", "copy link"), ("esc", "back")],
+            Screen::Setup => &[("←→↑↓", "move"), ("⏎", "open"), ("1-4", "jump"), ("esc", "back")],
+            Screen::Panel(_) if self.key_input.is_some() => &[("⏎", "save & test"), ("ctrl-o", "get a key"), ("esc", "cancel")],
+            Screen::Panel(Sec::Agent) => &[("↑↓", "move"), ("⏎", "set up"), ("←→", "change"), ("tab", "next panel"), ("esc", "back")],
+            Screen::Panel(Sec::Chatbots) => &[("↑↓", "move"), ("⏎", "connect / disconnect"), ("c", "copy link"), ("tab", "next panel"), ("esc", "back")],
+            Screen::Panel(Sec::Research) => &[("↑↓", "move"), ("⏎", "use / sign in"), ("k", "paste a key"), ("tab", "next panel"), ("esc", "back")],
+            Screen::Panel(_) => &[("↑↓", "move"), ("⏎", "connect / disconnect"), ("tab", "next panel"), ("esc", "back")],
             Screen::Journal => &[("↑↓", "scroll"), ("space", "page"), ("g/G", "top/bottom"), ("esc", "back")],
         };
         let mut spans = Vec::new();
@@ -782,7 +1077,8 @@ impl App {
         } else {
             lines.push(Line::styled("brief", Style::default().fg(ACCENT).bold()));
         }
-        lines.push(Line::styled("your chatbots log the work · Claude writes you a brief each morning", Style::default().fg(DIM)));
+        let agent = crate::agent::Agent::from_id(&self.store.config().agent).name();
+        lines.push(Line::styled(format!("your agents log the work · {agent} writes you a brief each morning"), Style::default().fg(DIM)));
         f.render_widget(Paragraph::new(lines), header);
 
         let s = &self.status;
@@ -835,7 +1131,7 @@ impl App {
             .map(|(n, _)| n)
             .collect();
         let todo = if apps.is_empty() {
-            row(Some(false), "apps", "none · Connect → Todoist, Granola, Calendar, Browser".into(), Style::default().fg(DIM))
+            row(Some(false), "apps", "none · Setup → What the brief reads".into(), Style::default().fg(DIM))
         } else {
             row(Some(true), "apps", format!("{} · read for the brief", apps.join(", ")), plain)
         };
@@ -964,233 +1260,332 @@ impl App {
         f.render_widget(para.scroll((self.scroll, 0)), body);
     }
 
-    fn draw_connect(&mut self, f: &mut Frame, area: Rect) {
-        let [title, help, rows, _, detail] =
-            Layout::vertical([Constraint::Length(2), Constraint::Length(2), Constraint::Length(CONNS.len() as u16 * 2 + 2), Constraint::Length(1), Constraint::Fill(1)])
-                .areas(area);
-        f.render_widget(screen_title("Connect"), title);
-        f.render_widget(Paragraph::new(Line::styled("Pick one and press ⏎. brief does the setup for you.", Style::default().fg(DIM))), help);
-
+    /// A row's name, state, state colour and what ⏎ does.
+    fn row_info(&self, conn: Conn) -> (String, String, Color, &'static str) {
         let s = &self.status;
+        let cfg = self.store.config();
+        let spin = self.spinner();
+        let onoff = |name: &str, on: bool| -> (String, String, Color, &'static str) {
+            (name.into(), if on { "connected".into() } else { "not connected".into() }, if on { GOOD } else { DIM }, if on { "⏎ disconnect" } else { "⏎ connect" })
+        };
+        let cli = |name: &str, (installed, on): (bool, bool)| -> (String, String, Color, &'static str) {
+            if !installed {
+                (name.into(), "not installed".into(), FAINT, "")
+            } else {
+                (name.into(), if on { "connected".into() } else { "not connected".into() }, if on { GOOD } else { DIM }, if on { "⏎ disconnect" } else { "⏎ connect" })
+            }
+        };
+        match conn {
+            Conn::Agent => {
+                let a = crate::agent::Agent::from_id(&cfg.agent);
+                ("Agent".into(), a.name().into(), if a.find().is_some() { GOOD } else { BAD }, "⏎ change agent")
+            }
+            Conn::Model => ("Model".into(), crate::agent::Agent::from_id(&cfg.agent).model_label(&cfg.model), ACCENT, "←→ change"),
+            Conn::Hour => ("Brief after".into(), format!("{:02}:00", cfg.brief_hour), ACCENT, "←→ change"),
+            Conn::Service => (
+                "Background service".into(),
+                if s.server_up { "running".into() } else if s.service_installed { "not responding".into() } else { "off".into() },
+                if s.server_up { GOOD } else if s.service_installed { BAD } else { DIM },
+                if s.service_installed { "⏎ stop" } else { "⏎ start at login" },
+            ),
+            Conn::ClaudeCode if !s.code_installed => ("Claude Code".into(), "not installed".into(), FAINT, ""),
+            Conn::ClaudeCode => onoff("Claude Code", s.code_connected),
+            Conn::ClaudeDesktop => (
+                "Claude Desktop".into(),
+                if s.desktop_extension {
+                    "installed".into()
+                } else if s.desktop_config_entry {
+                    "old dev setup".into()
+                } else if s.desktop_installed {
+                    "not connected".into()
+                } else {
+                    "not installed".into()
+                },
+                if s.desktop_extension { GOOD } else if s.desktop_config_entry { ACCENT } else { DIM },
+                if s.desktop_extension { "⏎ reinstall" } else { "⏎ install" },
+            ),
+            Conn::Codex => cli("Codex", s.codex),
+            Conn::Cline => cli("Cline", s.cline),
+            Conn::OpenCode => cli("OpenCode", s.opencode),
+            Conn::Tunnel => {
+                let (state, color) = if !s.tailscale {
+                    ("needs Tailscale".into(), DIM)
+                } else if !s.tunnel_on {
+                    ("off".into(), DIM)
+                } else if s.tunnel_url.is_some() {
+                    ("live".into(), GOOD)
+                } else if s.server_up {
+                    (format!("{spin} starting"), ACCENT)
+                } else {
+                    ("needs the service".into(), BAD)
+                };
+                ("Public link".into(), state, color, if !s.tailscale { "⏎ get Tailscale" } else if s.tunnel_on { "⏎ turn off" } else { "⏎ turn on" })
+            }
+            Conn::ChatGpt | Conn::ClaudeAi | Conn::Grok => (
+                match conn {
+                    Conn::ChatGpt => "ChatGPT",
+                    Conn::ClaudeAi => "claude.ai & phone",
+                    _ => "Grok",
+                }
+                .into(),
+                if s.tunnel_url.is_some() { "ready to add".into() } else { "needs public link".into() },
+                if s.tunnel_url.is_some() { ACCENT } else { FAINT },
+                if s.tunnel_url.is_some() { "⏎ copy link & open settings" } else { "" },
+            ),
+            Conn::Calendar => onoff("Calendar", s.calendar),
+            Conn::Todoist if s.todoist_read_only => ("Todoist".into(), "read-only".into(), ACCENT, "⏎ allow changes"),
+            Conn::Todoist => onoff("Todoist", s.todoist.is_some()),
+            Conn::Granola => onoff("Granola", s.granola.is_some()),
+            Conn::Browser => (
+                "Browser extension".into(),
+                if s.chrome_seen { "sending".into() } else if s.chrome_installed { "not loaded yet".into() } else { "not installed".into() },
+                if s.chrome_seen { GOOD } else if s.chrome_installed { ACCENT } else { DIM },
+                if s.chrome_seen { "⏎ update" } else { "⏎ install" },
+            ),
+            Conn::Anki => ("Anki".into(), if s.anki { "connected".into() } else { "not running".into() }, if s.anki { GOOD } else { DIM }, if s.anki { "" } else { "⏎ open Anki" }),
+            Conn::Composio => onoff("Composio", s.composio),
+            Conn::Search(p) => {
+                let name = if p == search::Provider::Parallel { "Parallel ★".to_owned() } else { p.name().to_owned() };
+                if s.search == Some(p) {
+                    (name, "in use".into(), GOOD, if p == search::Provider::Claude { "" } else { "⏎ test again" })
+                } else if search::ready(&self.store, p) {
+                    (name, "ready".into(), DIM, "⏎ use it")
+                } else if p == search::Provider::Parallel {
+                    (name, "not signed in".into(), DIM, "⏎ sign in with your browser")
+                } else {
+                    (name, "needs a key".into(), DIM, "⏎ paste a key")
+                }
+            }
+            Conn::Videos => (
+                "Videos".into(),
+                if s.manimgx { "on (ManimGX)".into() } else { "off".into() },
+                if s.manimgx { GOOD } else { DIM },
+                if s.manimgx { "" } else { "⏎ install ManimGX" },
+            ),
+        }
+    }
+
+    /// What the selected row does, for the box under a panel.
+    fn detail(&self, conn: Conn) -> Vec<Line<'static>> {
+        let s = &self.status;
+        let dim = Style::default().fg(DIM);
+        let good = Style::default().fg(GOOD);
+        let port = self.store.config().port;
+        let url_line = |url: &Option<String>| -> Line<'static> {
+            match url {
+                Some(u) => Line::from(vec![Span::styled("Link  ", dim), Span::styled(redact(u), Style::default().fg(ACCENT)), Span::styled("   c copy", Style::default().fg(FAINT))]),
+                None => Line::raw(""),
+            }
+        };
+        match conn {
+            Conn::Agent => vec![
+                Line::raw("The coding agent that writes your brief every morning and runs your objectives conversation, on your own account: Claude Code, Codex, Cline or OpenCode."),
+                Line::raw(""),
+                Line::styled("⏎ opens the agent picker: it shows which are installed and signed in, and can install or sign one in.", dim),
+            ],
+            Conn::Model => vec![Line::raw("The model your agent writes the brief with. The first one is the recommended one."), Line::styled("←→ to change.", dim)],
+            Conn::Hour => vec![Line::raw("The brief is written after this hour, local time. If your Mac was asleep, it catches up when it wakes."), Line::styled("←→ to change.", dim)],
+            Conn::Service => vec![
+                Line::raw("Runs brief in the background at login: it writes the brief every morning, serves your briefs at http://127.0.0.1, and keeps your chatbots' log."),
+                Line::raw(""),
+                Line::styled(format!("Your data lives in {}.", tilde(&self.store.root)), dim),
+            ],
+            Conn::ClaudeCode => vec![Line::raw("Adds brief to Claude Code for all your projects. New sessions can log your work and read your objectives.")],
+            Conn::ClaudeDesktop => vec![
+                Line::raw("Installs brief as a Claude Desktop extension, with its logo and description. Claude Desktop opens an install dialog: click Install."),
+                Line::styled("Remove it in Claude Desktop → Settings → Extensions.", dim),
+            ],
+            Conn::Codex => vec![Line::raw("Adds brief to Codex's MCP servers (codex mcp add), so Codex logs your work.")],
+            Conn::Cline => vec![Line::raw("Adds brief to Cline's MCP servers, for the CLI and the editor extensions.")],
+            Conn::OpenCode => vec![Line::raw("Adds brief to OpenCode's config as a local MCP server.")],
+            Conn::Tunnel => vec![
+                Line::raw("ChatGPT, claude.ai and Grok run in the cloud, so they can't reach your Mac directly. This gives brief's MCP endpoint, and only that, a permanent https link through Tailscale Funnel, locked with a secret key."),
+                Line::raw(""),
+                Line::styled("Needs Tailscale running and signed in. The first time, a Tailscale page opens where you allow Funnel.", dim),
+                url_line(&s.tunnel_url),
+            ],
+            Conn::ChatGpt => vec![
+                Line::raw("Copies your link and opens ChatGPT's connector settings. Turn on Developer mode, create a connector named “brief”, paste the link and choose “No authentication” (the key is in the link)."),
+                url_line(&s.tunnel_url),
+            ],
+            Conn::ClaudeAi => vec![
+                Line::raw("Copies your link and opens claude.ai's connector settings. Add a custom connector named “brief” and paste the link. It then works in the phone apps too."),
+                url_line(&s.tunnel_url),
+            ],
+            Conn::Grok => vec![
+                Line::raw("Copies your link and opens Grok's connectors. Add a custom connector named “brief”, paste the link, no authentication."),
+                Line::styled("Custom connectors may need a paid Grok plan.", dim),
+                url_line(&s.tunnel_url),
+            ],
+            Conn::Calendar => vec![
+                Line::raw("Where your time went, today's meetings and free blocks, and the week ahead, from every account in the Calendar app."),
+                if s.calendar { Line::styled("Connected.", good) } else { Line::styled("⏎: macOS asks whether brief may see your calendar; click Allow. Needs the Xcode command line tools.", dim) },
+            ],
+            Conn::Todoist => vec![
+                Line::raw("Your to-do list: projects, what's overdue or due soon, what you finished. Chatbots can add, reschedule or tick off to-dos when you ask."),
+                match &s.todoist {
+                    Some(who) if !who.is_empty() => Line::styled(format!("Connected as {who}."), good),
+                    Some(_) => Line::styled("Connected.", good),
+                    None => Line::styled("⏎: Todoist opens in your browser, you click Agree. No token to copy.", dim),
+                },
+            ],
+            Conn::Granola => vec![
+                Line::raw("Your Granola meeting notes: promises and follow-ups nobody wrote down, advice that changes a plan."),
+                match &s.granola {
+                    Some(who) if !who.is_empty() => Line::styled(format!("Connected as {who}."), good),
+                    Some(_) => Line::styled("Connected.", good),
+                    None => Line::styled("⏎: Granola opens in your browser; sign in and allow brief.", dim),
+                },
+            ],
+            Conn::Browser => vec![
+                Line::raw(format!("An extension for {} that tells the brief what you read: time per site and page, and what the pages you stayed on were about.", browsing::browser_name())),
+                if s.chrome_seen {
+                    Line::styled("Installed and sending.", good)
+                } else {
+                    Line::styled("⏎: the extensions page opens and the folder path is copied. Developer mode, Load unpacked, ⌘⇧G, paste, ⏎. Once only.", dim)
+                },
+            ],
+            Conn::Anki => vec![
+                Line::raw("Your flashcards: what's due, what you keep forgetting. Chatbots can add cards after a reviewer checks them."),
+                Line::styled("Needs the AnkiConnect add-on: in Anki, Tools → Add-ons → Get Add-ons…, code 2055492159.", dim),
+            ],
+            Conn::Composio => vec![
+                Line::raw("1,000+ more apps (Gmail, Slack, Notion, GitHub, Linear…) through Composio. The brief writer reads them with Composio's CLI, read-only."),
+                if s.composio { Line::styled("Connected. ⏎ turns it off; add apps with `composio link <app>`.", good) } else { Line::styled("⏎ installs Composio's CLI if needed, signs you in (a browser page opens) and asks which apps to link.", dim) },
+            ],
+            Conn::Search(p) => {
+                let mut t = vec![Line::raw(p.blurb().to_owned())];
+                t.push(Line::raw(""));
+                t.push(match p {
+                    search::Provider::Parallel if search::key(&self.store, p).is_some() => Line::styled("Using your API key.", good),
+                    search::Provider::Parallel if search::parallel_signed_in() => Line::styled("Signed in with parallel-cli.", good),
+                    search::Provider::Parallel => Line::styled("⏎ signs you in with your browser, no key to copy (installs Parallel's CLI if needed). k pastes an API key instead.", dim),
+                    search::Provider::Claude => Line::styled("Nothing to set up.", dim),
+                    _ if search::key(&self.store, p).is_some() => Line::styled("Key saved.", good),
+                    _ => Line::styled(format!("Needs an API key from {}. ⏎ to paste it.", p.key_url().unwrap_or_default()), dim),
+                });
+                if s.search == Some(p) {
+                    t.push(Line::styled("Your brief researches with this.", good));
+                }
+                t
+            }
+            Conn::Videos => vec![
+                Line::raw("Some items come with a short animation (made with ManimGX) that shows how a paper or idea works, in a few steps you click through."),
+                if s.manimgx { Line::styled("Installed: your briefs have videos.", good) } else { Line::styled(format!("⏎ installs it: {}", video::INSTALL), dim) },
+            ],
+        }
+        .into_iter()
+        .chain(matches!(conn, Conn::ClaudeCode | Conn::ClaudeDesktop | Conn::Codex | Conn::Cline | Conn::OpenCode).then(|| Line::styled(format!("Other MCP apps on this Mac can use http://127.0.0.1:{port}/mcp"), Style::default().fg(FAINT))))
+        .collect()
+    }
+
+    fn draw_setup(&mut self, f: &mut Frame, area: Rect) {
+        let [title, help, top, bottom] = Layout::vertical([Constraint::Length(2), Constraint::Length(2), Constraint::Length(11), Constraint::Length(9)]).areas(area);
+        f.render_widget(screen_title("Setup"), title);
+        f.render_widget(Paragraph::new(Line::styled("Everything brief uses, by section. Pick one and press ⏎.", Style::default().fg(DIM))), help);
+        let [a, b] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).spacing(1).areas(top);
+        let [c, d] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).spacing(1).areas(bottom);
+        for (i, cell) in [a, b, c, d].into_iter().enumerate() {
+            let sec = SECS[i];
+            let on = i == self.psel;
+            let w = cell.width.saturating_sub(4) as usize;
+            let lines: Vec<Line> = sec
+                .rows()
+                .into_iter()
+                .map(|conn| {
+                    let (name, state, color, _) = self.row_info(conn);
+                    let dot = if self.job.as_ref().is_some_and(|(c, _)| *c == conn) { self.spinner() } else if color == GOOD { "●" } else { "○" };
+                    let name_w = w.saturating_sub(state.chars().count() + 3).min(20);
+                    Line::from(vec![
+                        Span::styled(format!("{dot} "), Style::default().fg(color)),
+                        Span::raw(format!("{:<name_w$} ", truncate(&name, name_w))),
+                        Span::styled(truncate(&state, w.saturating_sub(name_w + 3)), Style::default().fg(color)),
+                    ])
+                })
+                .collect();
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(if on { ACCENT } else { LINE }))
+                .title(Line::from(vec![
+                    Span::styled(format!(" {} ", i + 1), Style::default().fg(FAINT)),
+                    Span::styled(format!("{} ", sec.title()), if on { Style::default().fg(ACCENT).bold() } else { Style::default().bold() }),
+                ]))
+                .padding(Padding::horizontal(1));
+            f.render_widget(Paragraph::new(lines).block(block), cell);
+        }
+    }
+
+    fn draw_panel(&mut self, f: &mut Frame, area: Rect, sec: Sec) {
+        let rows = sec.rows();
+        self.rsel = self.rsel.min(rows.len() - 1);
+        let [title, help, list, _, detail] =
+            Layout::vertical([Constraint::Length(2), Constraint::Length(3), Constraint::Length(rows.len() as u16 * 2), Constraint::Length(1), Constraint::Max(11)]).areas(area);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("brief ", Style::default().fg(DIM)),
+                Span::styled("› ", Style::default().fg(FAINT)),
+                Span::styled("Setup ", Style::default().fg(DIM)),
+                Span::styled("› ", Style::default().fg(FAINT)),
+                Span::styled(sec.title(), Style::default().fg(ACCENT).bold()),
+            ])),
+            title,
+        );
+        f.render_widget(Paragraph::new(Line::styled(sec.blurb(), Style::default().fg(DIM))).wrap(Wrap { trim: false }), help);
         let spin = self.spinner();
         let mut lines: Vec<Line> = Vec::new();
-        for (i, conn) in CONNS.iter().enumerate() {
-            if *conn == Conn::Todoist {
-                lines.push(Line::styled("   apps the brief reads", Style::default().fg(FAINT)));
-                lines.push(Line::raw(""));
-            }
-            let selected = i == self.csel;
+        for (i, conn) in rows.iter().enumerate() {
+            let selected = i == self.rsel;
             let working = self.job.as_ref().is_some_and(|(c, _)| c == conn);
-            let (name, state, color, action): (&str, String, Color, &str) = match conn {
-                Conn::ClaudeCode => (
-                    "Claude Code",
-                    if !s.code_installed { "not installed".into() } else if s.code_connected { "connected".into() } else { "not connected".into() },
-                    if s.code_connected { GOOD } else { DIM },
-                    if !s.code_installed { "" } else if s.code_connected { "⏎ disconnect" } else { "⏎ connect" },
-                ),
-                Conn::ClaudeDesktop => (
-                    "Claude Desktop",
-                    if s.desktop_extension {
-                        "installed".into()
-                    } else if s.desktop_config_entry {
-                        "old dev setup".into()
-                    } else if s.desktop_installed {
-                        "not connected".into()
-                    } else {
-                        "not installed".into()
-                    },
-                    if s.desktop_extension { GOOD } else if s.desktop_config_entry { ACCENT } else { DIM },
-                    if s.desktop_extension { "⏎ reinstall" } else { "⏎ install" },
-                ),
-                Conn::Tunnel => {
-                    let (state, color) = if !s.tailscale {
-                        ("needs Tailscale".into(), DIM)
-                    } else if !s.tunnel_on {
-                        ("off".into(), DIM)
-                    } else if s.tunnel_url.is_some() {
-                        ("live".into(), GOOD)
-                    } else if s.server_up {
-                        (format!("{spin} starting"), ACCENT)
-                    } else {
-                        ("waiting for background service".into(), BAD)
-                    };
-                    ("Public link", state, color, if !s.tailscale { "⏎ get Tailscale" } else if s.tunnel_on { "⏎ turn off" } else { "⏎ turn on" })
-                }
-                Conn::ChatGpt | Conn::ClaudeAi | Conn::Grok => (
-                    match conn {
-                        Conn::ChatGpt => "ChatGPT",
-                        Conn::ClaudeAi => "claude.ai, web & phone",
-                        _ => "Grok",
-                    },
-                    if s.tunnel_url.is_some() { "ready to add".into() } else { "needs the public link".into() },
-                    if s.tunnel_url.is_some() { ACCENT } else { FAINT },
-                    if s.tunnel_url.is_some() { "⏎ copy link & open settings" } else { "" },
-                ),
-                Conn::Todoist if s.todoist_read_only => ("Todoist", "read-only".into(), ACCENT, "⏎ allow changes"),
-                Conn::Browser => (
-                    "Browser extension",
-                    if s.chrome_seen { "sending".into() } else if s.chrome_installed { "not loaded in Chrome".into() } else { "not installed".into() },
-                    if s.chrome_seen { GOOD } else if s.chrome_installed { ACCENT } else { DIM },
-                    if s.chrome_seen { "⏎ update" } else { "⏎ install" },
-                ),
-                Conn::Todoist | Conn::Granola | Conn::Calendar => {
-                    let (name, on) = match conn {
-                        Conn::Todoist => ("Todoist", s.todoist.is_some()),
-                        Conn::Granola => ("Granola", s.granola.is_some()),
-                        _ => ("Calendar", s.calendar),
-                    };
-                    (
-                        name,
-                        if on { "connected".into() } else { "not connected".into() },
-                        if on { GOOD } else { DIM },
-                        if on { "⏎ disconnect" } else { "⏎ connect" },
-                    )
-                }
-            };
+            let (name, state, color, action) = self.row_info(*conn);
             let dot = if working { spin } else if color == GOOD { "●" } else { "○" };
             let name_style = if selected { Style::default().fg(ACCENT).bold() } else { Style::default() };
             lines.push(Line::from(vec![
                 Span::styled(if selected { " › " } else { "   " }, Style::default().fg(ACCENT)),
-                Span::styled(format!("{name:<24}"), name_style),
+                Span::styled(format!("{name:<22}"), name_style),
                 Span::styled(format!("{dot} "), Style::default().fg(if working { ACCENT } else { color })),
                 Span::styled(format!("{:<20}", if working { "working…".into() } else { state }), Style::default().fg(if working { ACCENT } else { color })),
                 Span::styled(if selected { action } else { "" }, Style::default().fg(DIM)),
             ]));
             lines.push(Line::raw(""));
         }
-        f.render_widget(Paragraph::new(lines), rows);
+        f.render_widget(Paragraph::new(lines), list);
 
-        let port = self.store.config().port;
-        let url_line = |url: &Option<String>| -> Line {
-            match url {
-                Some(u) => Line::from(vec![Span::styled("Link  ", Style::default().fg(DIM)), Span::styled(redact(u), Style::default().fg(ACCENT)), Span::styled("   c copy", Style::default().fg(FAINT))]),
-                None => Line::raw(""),
-            }
-        };
-        let dim = Style::default().fg(DIM);
-        let text: Vec<Line> = match CONNS[self.csel] {
-            Conn::ClaudeCode => vec![Line::raw(
-                "Adds brief to Claude Code for all your projects. New sessions can log your work and read your objectives.",
-            )],
-            Conn::ClaudeDesktop => vec![
-                Line::raw("Installs brief as a Claude Desktop extension, with its logo and description. Claude Desktop opens an install dialog: click Install."),
-                Line::raw("It runs the same `brief` command, so `make` reaches it without reinstalling. Remove it in Claude Desktop → Settings → Extensions."),
-            ],
-            Conn::Tunnel => vec![
-                Line::raw("ChatGPT, claude.ai and Grok run in the cloud, so they can't reach your Mac directly. This gives brief's MCP endpoint, and only that, a permanent https link through Tailscale Funnel, locked with a secret key. Your briefs and journal stay local."),
-                Line::raw(""),
-                Line::styled("Needs Tailscale running and signed in. The first time, a Tailscale page opens where you allow Funnel. The link stays the same across restarts; it only works while this Mac is awake.", dim),
-                Line::raw(""),
-                url_line(&s.tunnel_url),
-            ],
-            Conn::ChatGpt => vec![
-                Line::raw("Copies your link and opens ChatGPT's connector settings. There, turn on Developer mode, create a connector named “brief”, paste the link as its URL and choose “No authentication” (the key is in the link)."),
-                Line::raw(""),
-                url_line(&s.tunnel_url),
-            ],
-            Conn::ClaudeAi => vec![
-                Line::raw("Copies your link and opens claude.ai's connector settings. Add a custom connector named “brief” and paste the link."),
-                Line::raw(""),
-                Line::styled("It then also works in the phone apps and Claude Desktop, so you won't need the Claude Desktop row.", dim),
-                Line::raw(""),
-                url_line(&s.tunnel_url),
-            ],
-            Conn::Grok => vec![
-                Line::raw("Copies your link and opens Grok's connectors. Add a new custom connector named “brief” and paste the link as its URL, with no authentication (the key is in the link)."),
-                Line::raw(""),
-                Line::styled("Custom connectors may need a paid Grok plan.", dim),
-                Line::raw(""),
-                url_line(&s.tunnel_url),
-            ],
-            Conn::Todoist => vec![
-                Line::raw("Your to-do list. The daily brief reads it: your projects, what's overdue or due soon, and what you finished, tied to your objectives and journal (goals with no tasks, tasks that keep slipping, work you did that no task planned). Your chatbots see it as your to-do list and can add, reschedule or tick off to-dos when you ask them to."),
-                Line::raw(""),
-                match &s.todoist {
-                    Some(who) if !who.is_empty() => Line::styled(format!("Connected as {who}."), Style::default().fg(GOOD)),
-                    Some(_) => Line::styled("Connected.", Style::default().fg(GOOD)),
-                    None => Line::styled("Press ⏎: Todoist opens in your browser, you click Agree, done. No token to copy.", dim),
-                },
-                if s.todoist_read_only {
-                    Line::styled("Connected read-only, so chatbots can't add or change to-dos yet. Press ⏎ and click Agree to allow it.", Style::default().fg(ACCENT))
-                } else {
-                    Line::styled("Chatbots change to-dos only when you ask or agree. Run `brief todoist` to see exactly what the brief sees.", dim)
-                },
-            ],
-            Conn::Granola => vec![
-                Line::raw("Lets the daily brief read your Granola meeting notes. It catches promises and follow-ups from meetings that aren't in your to-do list or journal, advice that changes a plan, and people who connect to another project."),
-                Line::raw(""),
-                match &s.granola {
-                    Some(who) if !who.is_empty() => Line::styled(format!("Connected as {who}."), Style::default().fg(GOOD)),
-                    Some(_) => Line::styled("Connected.", Style::default().fg(GOOD)),
-                    None => Line::styled("Press ⏎: Granola opens in your browser, you sign in and allow brief, done.", dim),
-                },
-                Line::styled("Read-only, through Granola's official connector. Run `brief granola` to see exactly what the brief sees.", dim),
-            ],
-            Conn::Calendar => vec![
-                Line::raw("Lets the daily brief read your calendar: where your time went since the last brief, today's meetings and free blocks, and the week ahead. It weighs that against your objectives, so it can say what to move, drop or protect time for."),
-                Line::raw(""),
-                if s.calendar {
-                    Line::styled("Connected.", Style::default().fg(GOOD))
-                } else {
-                    Line::styled("Press ⏎: macOS asks whether brief may see your calendar; click Allow. Reads every account in the Calendar app (Google, iCloud, Outlook).", dim)
-                },
-                Line::styled("Read-only. Needs the Xcode command line tools. Run `brief calendar` to see exactly what the brief sees.", dim),
-            ],
-            Conn::Browser => vec![
-                Line::raw(format!(
-                    "An extension for {} that tells the brief what you read and worked on there: time per site and page, and what the pages you stayed on were about. The brief checks that against your objectives, calendar and to-dos.",
-                    browsing::browser_name()
-                )),
-                Line::raw(""),
-                if s.chrome_seen {
-                    Line::styled("Installed and sending. ⏎ rewrites it from this build of brief; it reloads itself within a minute.", Style::default().fg(GOOD))
-                } else {
-                    Line::styled("Press ⏎: your browser's extensions page opens and the folder path is copied. Turn on Developer mode, click Load unpacked, press ⌘⇧G, paste, ⏎. Only once: updates are automatic after that.", dim)
-                },
-                Line::styled("Stays on this Mac. Skips mail, banks and password managers; pause it or block a site from its toolbar button. `brief browser status` shows what it sent.", dim),
-            ],
-        };
-        let mut text = text;
-        if !matches!(CONNS[self.csel], Conn::Todoist | Conn::Granola | Conn::Calendar | Conn::Browser) {
-            text.push(Line::raw(""));
-            text.push(Line::styled(format!("Other MCP apps on this Mac can use http://127.0.0.1:{port}/mcp"), Style::default().fg(FAINT)));
-        }
-        f.render_widget(
+        let boxed = |text: Vec<Line<'static>>| {
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
-                .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(LINE)).padding(Padding::horizontal(1))),
-            detail,
-        );
-    }
-
-    fn draw_settings(&mut self, f: &mut Frame, area: Rect) {
-        let [title, body] = Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
-        f.render_widget(screen_title("Settings"), title);
-        let cfg = self.store.config();
-        let agent = crate::agent::Agent::from_id(&cfg.agent);
-        let rows = [
-            ("Write the brief after", format!("{:02}:00", cfg.brief_hour), "local time; catches up if your Mac was asleep"),
-            ("Model", agent.model_label(&cfg.model), "the first one is the recommended one; `brief init` changes the agent"),
-        ];
-        let mut lines = Vec::new();
-        for (i, (label, value, hint)) in rows.iter().enumerate() {
-            let on = i == self.settings_row;
-            let arrow = if on { Style::default().fg(ACCENT) } else { Style::default().fg(LINE) };
-            lines.push(Line::from(vec![
-                Span::styled(if on { " › " } else { "   " }, Style::default().fg(ACCENT)),
-                Span::styled(format!("{label:<24}"), if on { Style::default().bold() } else { Style::default() }),
-                Span::styled("‹ ", arrow),
-                Span::styled(format!("{value:^20}"), if on { Style::default().fg(ACCENT).bold() } else { Style::default() }),
-                Span::styled(" ›", arrow),
-            ]));
-            lines.push(Line::styled(format!("   {hint}"), Style::default().fg(DIM)));
-            lines.push(Line::raw(""));
+                .block(Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(LINE)).padding(Padding::horizontal(1)))
+        };
+        if let Some((p, ed)) = &self.key_input {
+            let key = ed.text();
+            let n = key.chars().count();
+            let shown = if key.is_empty() {
+                Line::styled("paste your key", Style::default().fg(FAINT))
+            } else {
+                Line::raw(format!("{}{}", "•".repeat(n.saturating_sub(4).min(40)), key.chars().skip(n.saturating_sub(4)).collect::<String>()))
+            };
+            let [input, info] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(detail);
+            f.render_widget(
+                Paragraph::new(shown).block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(ACCENT))
+                        .title(format!(" {} API key ", p.name()))
+                        .padding(Padding::horizontal(1)),
+                ),
+                input,
+            );
+            f.set_cursor_position(Position::new(input.x + 2 + n.min(44) as u16, input.y + 1));
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(format!("Get one at {} (ctrl-o opens it), paste it and press ⏎.", p.key_url().unwrap_or_default()), Style::default().fg(DIM)),
+                    Line::styled("It's kept in search.json in brief's folder, readable only by you.", Style::default().fg(FAINT)),
+                ])
+                .wrap(Wrap { trim: false }),
+                info,
+            );
+        } else {
+            f.render_widget(boxed(self.detail(rows[self.rsel])), detail);
         }
-        lines.push(Line::styled(
-            format!("   Your data lives in {}. Port ({}) is set in config.json there.", tilde(&self.store.root), cfg.port),
-            Style::default().fg(FAINT),
-        ));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
     }
 
     fn clamp_scroll(&mut self, lines: usize, height: u16) {

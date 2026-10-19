@@ -5,6 +5,9 @@
 //!   entries.jsonl      everything your chatbots logged via MCP
 //!   feedback.jsonl     your reactions to brief items
 //!   briefs/DATE.json   one generated brief per day
+//!   briefs/versions/   earlier versions of a brief, kept when it is rewritten (DATE.N.json)
+//!   briefs/media/DATE/ the brief's explainer videos (see video.rs)
+//!   search.json        the search provider the brief uses, and its API keys (see search.rs)
 //!   anki_*.jsonl       cards proposed for Anki, and the user's buries (see anki.rs)
 //!   todoist.json       Todoist access token (see todoist.rs)
 //!   calendar.json      set when the calendar is connected (see calendar.rs)
@@ -140,6 +143,24 @@ pub struct Brief {
     pub terms: Vec<Term>,
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// How the brief researched: the provider and the questions it searched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research: Option<Research>,
+    /// 1 for the first brief of a day, then +1 each time it's rewritten (`brief regenerate`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub version: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Research {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub queries: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -192,6 +213,16 @@ pub struct Item {
     /// A small diagram (flow, compare, bars, timeline, stat), drawn by the page's JS.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub visual: serde_json::Value,
+    /// A storyboard for an explainer video ({title, insight, source, beats}), rendered with ManimGX.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub video: serde_json::Value,
+    /// The rendered video, under briefs/media/DATE/ ("" until it's rendered, or if it failed).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub video_file: String,
+    /// The video as clips, one per beat, played one at a time as the reader steps through
+    /// (video_file is the first). Empty for single-file videos from before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub video_clips: Vec<String>,
     #[serde(default)]
     pub links: Vec<Link>,
 }
@@ -298,6 +329,39 @@ impl Store {
         let date = b.date.context("brief without date")?;
         fs::write(self.brief_path(date), serde_json::to_string_pretty(b)?)?;
         Ok(())
+    }
+
+    /// Keep the current brief of `date` as an earlier version before it's rewritten. Returns its number.
+    pub fn archive_brief(&self, date: NaiveDate) -> Result<Option<u32>> {
+        let Some(b) = self.brief(date) else { return Ok(None) };
+        let n = b.version.max(1);
+        let dir = self.root.join("briefs/versions");
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(format!("{date}.{n}.json")), serde_json::to_string_pretty(&b)?)?;
+        Ok(Some(n))
+    }
+
+    /// Earlier versions of a brief, oldest first.
+    pub fn brief_versions(&self, date: NaiveDate) -> Vec<u32> {
+        let prefix = format!("{date}.");
+        let mut v: Vec<u32> = fs::read_dir(self.root.join("briefs/versions"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok()?.strip_prefix(&prefix)?.strip_suffix(".json")?.parse().ok())
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    pub fn brief_version(&self, date: NaiveDate, n: u32) -> Option<Brief> {
+        let s = fs::read_to_string(self.root.join(format!("briefs/versions/{date}.{n}.json"))).ok()?;
+        serde_json::from_str(&s).ok()
+    }
+
+    /// Where a brief's videos go.
+    pub fn media_dir(&self, date: NaiveDate) -> PathBuf {
+        self.root.join("briefs/media").join(date.to_string())
     }
 
     /// Dates with a brief, newest first.

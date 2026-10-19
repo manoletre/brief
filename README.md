@@ -19,11 +19,13 @@ While developing, just run `make` after each change: ~/.cargo/bin/brief is a sym
 to target/release/brief, so the command, the background service and the chatbots'
 MCP connections all pick up the new build.
 
-Other commands: `generate` (write today's brief now), `extension` (install into Claude Desktop with logo and description), `objectives` (edit in $EDITOR),
+Other commands: `generate` (write today's brief now), `regenerate [DATE…]` (rewrite briefs you already have
+with the current method and your feedback on them; `--videos-only` just renders missing videos), `search`
+(which search the brief uses: `brief search use parallel <key>`, `brief search setup`), `extension` (install into Claude Desktop with logo and description), `objectives` (edit in $EDITOR),
 `log <project> <text>`, `anki [search]` (your decks and cards), `todoist` / `granola` (connect, or show what the brief sees; `todoist off` disconnects), `mcp` (stdio transport), `key` (rotate the public link's key).
 
 Cloud chatbots (ChatGPT, claude.ai, Grok) reach brief through Tailscale Funnel: in
-`brief` → Connect chatbots, press ⏎ on "Public link". Funnel forwards to a second local
+`brief` → Setup → Chatbots, press ⏎ on "Public link". Funnel forwards to a second local
 port (7879) that serves only /mcp and requires the key; the website on 7878 answers
 only requests addressed to localhost.
 
@@ -55,8 +57,59 @@ MCP tools: `log_work` (write) and `get_context` (read) for the journal; `anki_se
    [Composio](https://composio.dev) for everything else: brief installs its CLI, runs `composio login`
    and `composio link <app>` for the apps you name, and the brief writer then reads them with
    `composio search` / `composio execute` (read-only tools only).
-6. **Every morning**: run in the background (launchd), then a **first brief** written right away,
+6. **Research and videos**: what the brief searches the web with: [Parallel](https://parallel.ai)
+   (recommended), Brave Search, Browserbase, or just the agent's own search. For Parallel, one ⏎
+   installs Parallel's CLI if needed (`uv tool install 'parallel-web-tools[cli]'`) and runs
+   `parallel-cli login`, a browser sign-in with no key to copy (`k` pastes an API key instead);
+   the others take an API key. Then a test search, and a check for
+   [ManimGX](https://manimgx.academa.ai) (the videos), which it offers to install with uv.
+7. **Every morning**: run in the background (launchd), then a **first brief** written right away,
    which you can open in the browser, and a rating and comment that tomorrow's brief reads.
+
+## Setup
+
+`brief` → Setup shows everything brief uses as four panels: **Your agent** (agent, model, brief
+time, background service), **Chatbots that log your work** (Claude Code, Claude Desktop, Codex,
+Cline, OpenCode, the public link and the cloud chatbots), **What the brief reads** (Calendar,
+Todoist, Granola, the browser extension, Anki, Composio) and **Research & videos** (Parallel,
+Brave, Browserbase, the agent's own search, ManimGX). ⏎ opens a panel; ⏎ on a row sets it up.
+Sign-ins and installs that need the terminal (Parallel, Composio, ManimGX) take it over and come
+back; changing the agent opens onboarding's agent picker and returns to Setup.
+
+## How a brief is written
+
+The brief holds you to what you say you want: its first item, **Trying vs building**, puts what you
+actually built and did this week next to what your objectives need, bluntly. It also teaches: one or
+two **Learn** items explain a concept you're fumbling, and **Hidden gems** are papers, repos and
+write-ups the writer found by researching your open problems from the journal (and read before
+recommending). The queries it ran are listed on the intro card.
+
+Searching goes through `brief search` (`src/search.rs`), which the agent may run during a brief:
+
+| Provider    | What it uses                                                    | Key                  |
+|-------------|-----------------------------------------------------------------|----------------------|
+| Parallel    | Search API (objective + queries → relevant excerpts), Extract API to read pages (`brief search --read`) | none if `parallel-cli` is signed in; else `PARALLEL_API_KEY` or search.json |
+| Brave       | Brave Search API, web results with extra snippets               | `BRAVE_API_KEY`      |
+| Browserbase | Browserbase Search API (the team behind browse.sh)              | `BROWSERBASE_API_KEY`|
+| Your agent  | the agent's own WebSearch / WebFetch                            | none                 |
+
+With a provider other than the agent's own, Claude Code's WebSearch is turned off for the brief so
+everything goes through it. Codex can't run commands with network in its sandbox, so it always uses
+its own search.
+
+**Videos.** For the Learn items and gems whose method is easier seen than read, the writer adds a
+storyboard (the insight, and 2-4 beats of caption + what to draw, from the source it read). Each
+beat becomes its own short clip that ends on a still frame; the page shows the caption under it,
+and Next (→) steps to the next clip before moving to the next card. For each, the agent
+writes a [ManimGX](https://manimgx.academa.ai) scene (`src/video.rs`: Manim CE's API, black, white,
+orange, monospace, math typeset with Typst). `manimgx inspect` checks the layout first (text cut off,
+overlapping or too small), then `manimgx render` writes `briefs/media/DATE/vN/ITEM-K.mp4`, one per beat; a scene with
+errors or layout problems goes back to the agent with them, twice at most. The video plays when its card comes up.
+
+**Rewriting.** `brief regenerate` (or "Rewrite with my feedback" at the end of a brief) writes a brief
+again with the current method: as of that day for past briefs (journal and feedback up to then), with
+your ratings and comments on the old version. The old version is kept in `briefs/versions/` and
+linked as v1, v2… from the new one.
 
 ## The brief page
 
@@ -163,7 +216,7 @@ they never learn which app is behind it. `src/todos.rs` holds that app-agnostic 
 implements its `TodoApp` trait. Todoist (`src/todoist.rs`) is the only one so far. Chatbots are told
 to add or change to-dos only when you ask, or after you agree to one they propose.
 
-In `brief` → Connect, press ⏎ on Todoist: Todoist opens in your browser, you click Agree, done.
+In `brief` → Setup → What the brief reads, press ⏎ on Todoist: Todoist opens in your browser, you click Agree, done.
 No developer account or token to paste: brief registers itself with Todoist on the spot (OAuth
 dynamic client registration with PKCE), catches the redirect on a one-off local port, and keeps a
 `data:read_write` token in `todoist.json`. `brief todoist` does the same from the terminal.
@@ -179,7 +232,7 @@ real tasks when they fit.
 
 ## Granola
 
-Same idea for meeting notes: in `brief` → Connect, press ⏎ on Granola, sign in and allow brief.
+Same idea for meeting notes: in `brief` → Setup → What the brief reads, press ⏎ on Granola, sign in and allow brief.
 Granola has no public API for personal accounts, so brief talks to Granola's official MCP server
 (mcp.granola.ai) itself, signing in the same way (dynamic registration + PKCE, token in
 `granola.json`), and calls only its read-only tools, `list_meetings` and `get_meetings`.
